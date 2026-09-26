@@ -8,6 +8,14 @@
 
 In every sector studied, the dominant bottleneck is keeping per-person, per-asset or per-product evidence files complete, current and producible on demand, followed by re-typing the same facts into mandated portals and customer questionnaires. The best fit for a small firm is one reusable "people/entities × requirements × expiry × evidence" engine with a thin per-jurisdiction rules layer, sold as companion tools that sit beside mandated systems of record (Metrc, the FMCSA Clearinghouse, CAQH, state EVV aggregators, CBP ACE) rather than replacing them.
 
+## Validation
+
+- **[Reddit validation, 2026-09-25](validation/2026-09-reddit/report.md).** This pass read about 2,300 first-hand Reddit posts from 2024–2026 across 53 subreddits.
+  - It confirms the pain but moves **all six tier-1 opportunities down**. Each already faces cheap, free or open-source competitors, most launched in 2025–26. The HVAC refrigerant logger is rejected outright.
+  - It adds one Watch lead: an MSP tool for completing clients' cyber-insurance applications.
+  - It adds four near misses: a state payroll-tax account register, do-it-yourself charitable registration, income recertification for small owners of inclusionary units, and CPSC eFiling certificate prep.
+  - The report below is unchanged. Read the validation before acting on its ranking.
+
 ## Top of the ranking
 
 Scored 1–5 on pain and evidence, timing, competitor gap, build complexity and liability, and distribution (maximum 25). The full table of 20 is in the report.

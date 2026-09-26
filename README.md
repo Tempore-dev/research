@@ -6,7 +6,7 @@ Market and product research for Tempore: what to build next, for whom, and why. 
 
 | Study | Date | Question | Report |
 |---|---|---|---|
-| Compliance bottlenecks | September 2026 | Which compliance frustrations practitioners voice online could Tempore turn into software? | [report](compliance-bottlenecks-2026-09/report.md) · [notes](compliance-bottlenecks-2026-09/notes/) |
+| Compliance bottlenecks | September 2026 | Which compliance frustrations practitioners voice online could Tempore turn into software? | [report](compliance-bottlenecks-2026-09/report.md) · [notes](compliance-bottlenecks-2026-09/notes/) · [Reddit validation](compliance-bottlenecks-2026-09/validation/2026-09-reddit/report.md) |
 
 ## Conventions
 
