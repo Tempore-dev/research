@@ -4,6 +4,13 @@
 
 **Date:** 2026-09-25. **Method:** see [How this was done](#how-this-was-done-and-its-limits).
 
+> **Update, 2026-09-26.** The desk tests recommended below were run the next day, and the leads in this report did not survive.
+> - **MSP cyber-insurance filler (Watch):** rejected. Nine carrier forms overlap at the level of facts, which is what the test required. But at least three 2026 entrants already map one set of evidence onto several carriers' forms: BindLedger, InsurableIT and vCISO Lite.
+> - **State payroll-tax register (near miss):** rejected. Mosey still serves employers outside Gusto, and Middesk, ADP and Paycom already handle agency notices.
+> - **Do-it-yourself charitable registration (near miss):** rejected. Affinity sells a do-it-yourself portal at $45 per state.
+>
+> The two remaining near misses, income recertification and CPSC eFiling certificate prep, are unchanged. The shared opportunity tracker (`Projects/app-opportunities.md`) holds the current ranking and evidence.
+
 ## Summary
 
 The pain the study described is real and appears first-hand across almost every subreddit read. Small operators do lose deals, deposits, listings and bookings over missing or expired evidence, and they do re-type the same facts into forms that differ for every requester.
