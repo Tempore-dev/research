@@ -300,5 +300,79 @@ class MacNotifyCommandTests(unittest.TestCase):
                          ["/opt/homebrew/bin/terminal-notifier", "osascript"])
 
 
+class MacAlertTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.popens = []
+        self._popen, self._plat = s.subprocess.Popen, s.sys.platform
+        s.subprocess.Popen = lambda args, **k: self.popens.append((args, k))
+        s.sys.platform = "darwin"
+        self._reports, s.REPORTS = s.REPORTS, tempfile.mkdtemp()
+
+    def tearDown(self):
+        s.subprocess.Popen, s.sys.platform = self._popen, self._plat
+        s.REPORTS = self._reports
+
+    def test_one_alert_with_open_details_button(self):
+        items = [(f"S{i} -4.9% → Buy", "Automated selling", 'says "hi"')
+                 for i in range(8)]
+        self.assertEqual(s.notify_items(items, "/tmp/latest.html"),
+                         "macOS alert")
+        self.assertEqual(len(self.popens), 1)
+        args, kw = self.popens[0]
+        title, text, path, button = args[-4:]
+        self.assertEqual(title, "Market moves: 8 new signal(s)")
+        self.assertIn('S0 -4.9% → Buy\nAutomated selling\nsays "hi"', text)
+        self.assertTrue(text.endswith("…and 2 more"))
+        self.assertEqual((path, button), ("/tmp/latest.html", "Open details"))
+        self.assertTrue(kw["start_new_session"])
+        script = " ".join(a for a in args[1:-4] if a != "-e")
+        self.assertIn("giving up after 240", script)
+        self.assertIn('do shell script "open " & quoted form of (item 3',
+                      script)
+        self.assertNotIn("S0", script)  # text only ever passed as arguments
+
+    def test_error_alert_opens_log(self):
+        s.notify_error_once("HTTP 401 Unauthorized")
+        args, _ = self.popens[0]
+        self.assertEqual(args[-1], "Open log")
+        self.assertTrue(args[-2].endswith("scanner.log"))
+
+    def test_banner_style_opt_in(self):
+        sent = []
+        orig = s.notify
+        s.notify = lambda *a: sent.append(a) or "banner"
+        s.os.environ["MAC_NOTIFY"] = "banner"
+        try:
+            s.notify_items([("T", "S", "B")], "/tmp/x.html")
+        finally:
+            s.notify = orig
+            del s.os.environ["MAC_NOTIFY"]
+        self.assertEqual(self.popens, [])
+        self.assertEqual(sent, [("T", "B", "S", "/tmp/x.html")])
+
+
+class HtmlReportTests(unittest.TestCase):
+    def test_page_escapes_and_marks_new(self):
+        m = s.analyse_move("A&B", "A&B <Corp>", bars([95.0] * 10,
+                                                     first_open=95.0),
+                           daily(), FLAT_SPY, 100.0, 5e7, NOW)
+        v = s.Verdict("News-driven", 60, 70, 10, "negative", ["x < y"],
+                      [{"title": "<b>Guidance cut</b>", "ts": 0,
+                        "publisher": "Wire", "link": "https://e.com/?a=1&b=2"}])
+        r = s.Rating("Hold", 40.0, {"valuation": None, "momentum": 55})
+        page = s.render_html(NOW, "hdr", [{"move": m, "verdict": v,
+                                           "rating": r}], {"A&B"})
+        self.assertIn("A&amp;B &lt;Corp&gt;", page)
+        self.assertIn("&lt;b&gt;Guidance cut&lt;/b&gt;", page)
+        self.assertIn('href="https://e.com/?a=1&amp;b=2"', page)
+        self.assertIn('class="card new"', page)
+        self.assertIn("<td>n/a</td>", page)
+        self.assertNotIn("<b>Guidance", page)
+
+    def test_sample_page_renders(self):
+        self.assertIn("NVDA", s.sample_page())
+
+
 if __name__ == "__main__":
     unittest.main()

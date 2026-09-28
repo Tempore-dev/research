@@ -7,9 +7,9 @@
 3. Decides whether each move is **news-driven** or **automated / flow-driven selling (or buying)**.
 4. Rates the stock **Strong Buy**, **Buy** or **Hold**.
 5. Saves the results and alerts you:
-   - `reports/latest.md`: the full table from the latest run.
+   - `reports/latest.html` (and `latest.md`): every current large move, with details.
    - `reports/<date>.md`: new or changed signals only.
-   - A desktop notification for each new signal, so you never have to check the terminal.
+   - An alert for new signals, with an **Open details** button, so you never have to check the terminal.
 
 It needs Python 3.9 or later and a free [Alpaca](https://alpaca.markets) account. No packages to install. Not investment advice.
 
@@ -40,27 +40,26 @@ The computer has to be awake for scans to run. If you'd rather keep it in a term
 
 ## Notifications
 
-You don't need to watch the terminal. Each new or changed signal gets its own desktop notification:
+You don't need to watch the terminal. When a scan finds new or changed signals, you get an alert listing them:
 
-> **NVDA −4.9% → Buy**
+> **Market moves: 2 new signal(s)**
+> NVDA −4.9% → Buy
 > Automated selling · $118.20 · score 64.5
 > No catalyst headlines found; steady, evenly sized bars (execution-algo footprint)
+>
+> [Dismiss] **[Open details]**
 
-A news-driven move shows its top headline instead. A scan sends at most four notifications, and any further signals are summed up in one more. The same stock doesn't alert again that day unless its driver or rating changes, or the move grows by 2 more points. Scans that find nothing stay silent.
+**Open details** opens `reports/latest.html` in your browser. It shows every current large move with its driver, evidence, headlines (linked) and factor scores, and marks the new ones. The alert closes by itself after 4 minutes if you don't click it.
 
-If scheduled scans start failing (bad keys, no internet), you get one "scans failing" alert per day until a scan succeeds again.
+- **No repeats:** the same stock doesn't alert again that day unless its driver or rating changes, or the move grows by 2 more points.
+- **Quiet when nothing happens:** scans that find nothing stay silent.
+- **Failure alerts:** if scheduled scans start failing (bad keys, no internet), you get one "scans failing" alert per day, with an **Open log** button, until a scan succeeds.
 
-**Check that notifications reach you:** `python3 scanner.py --test-notification` shows a sample.
+`python3 scanner.py --test-notification` shows a sample alert. Its **Open details** button opens a sample page.
 
-- **macOS:** notifications appear as coming from **Script Editor**. If the sample doesn't show up:
-  1. Turn off Focus / Do Not Disturb (Control Center, top right of the menu bar).
-  2. macOS only lists Script Editor under Notifications after Script Editor has shown one itself. Open **Script Editor** (Applications → Utilities), paste `display notification "hello" with title "Test"`, and click ▶ Run. Click **Allow** if macOS asks.
-  3. In System Settings → Notifications → **Script Editor**, turn on *Allow notifications* and choose the **Alerts** style so they stay on screen until you dismiss them.
-  4. Run `python3 scanner.py --test-notification` again.
-
-  Clicking a Script Editor notification opens Script Editor; macOS doesn't let a script choose what a click does. To make clicks open `reports/latest.md`, install terminal-notifier (`brew install terminal-notifier`), which the scanner uses automatically. It needs its own permission: if the test prints `Notifications are not allowed for this application`, open System Settings → Notifications → **terminal-notifier**, turn on *Allow notifications*, and choose **Alerts**. Until then the scanner falls back to Script Editor notifications, so no alert is lost.
-- **Linux:** uses `notify-send` (package `libnotify-bin` on Debian/Ubuntu). It works from cron too.
-- **Windows:** shows a system-tray balloon.
+- **macOS:** the alert above works without extra setup or permissions. If you prefer Notification Center banners, set `MAC_NOTIFY=banner`. Clicking a plain banner opens Script Editor, because macOS doesn't let scripts choose what a click does. With terminal-notifier (`brew install terminal-notifier`) and its notifications allowed in System Settings → Notifications, a click opens the details page instead.
+- **Linux:** one `notify-send` banner per signal (package `libnotify-bin` on Debian/Ubuntu). It works from cron too.
+- **Windows:** one system-tray balloon per signal.
 
 `--no-alert` turns notifications off.
 
@@ -110,7 +109,7 @@ A scan makes about 4 Alpaca requests. Daily bars are fetched once a day and cach
 
 - `--force`: run even when the market is closed (uses the last session's data).
 - `--no-alert`: skip desktop notifications.
-- `--test-notification`: show a sample notification.
+- `--test-notification`: show a sample alert.
 - `--every MIN`: keep running and scan every MIN minutes.
 - `--setup`: enter, check and save your Alpaca keys and data feed.
 - `--diagnose`: test each data source and print which ones respond. Use it when a scan fails.

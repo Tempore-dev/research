@@ -903,6 +903,97 @@ def render(now: dt.datetime, header: str, results: list[dict]) -> str:
     return "\n".join(out)
 
 
+HTML_STYLE = """
+:root { --bg:#f6f7f9; --card:#fff; --text:#1b1f24; --muted:#5b6470;
+  --line:#e2e5ea; --up:#0a7a3d; --down:#c2261d; --accent:#2556d8;
+  --badge:#eef1f6; }
+@media (prefers-color-scheme: dark) { :root { --bg:#111418; --card:#1a1e24;
+  --text:#e8eaed; --muted:#9aa3ad; --line:#2a3038; --up:#3ccf7e;
+  --down:#ff6b61; --accent:#7ea2ff; --badge:#252b33; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text);
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+main { max-width:860px; margin:0 auto; padding:24px 16px 48px; }
+h1 { font-size:22px; margin:0 0 4px; }
+.meta { color:var(--muted); margin:0 0 20px; }
+.card { background:var(--card); border:1px solid var(--line);
+  border-radius:12px; padding:16px 18px; margin:0 0 14px; }
+.card.new { border-color:var(--accent); }
+.head { display:flex; flex-wrap:wrap; align-items:baseline; gap:8px 14px; }
+.sym { font-size:20px; font-weight:700; }
+.name { color:var(--muted); }
+.move { font-weight:700; font-variant-numeric:tabular-nums; }
+.up { color:var(--up); } .down { color:var(--down); }
+.rating { margin-left:auto; font-weight:700; padding:2px 10px;
+  border-radius:999px; background:var(--badge); }
+.tag { font-size:12px; font-weight:700; color:var(--accent);
+  text-transform:uppercase; letter-spacing:.04em; }
+.driver { margin:8px 0 4px; font-weight:600; }
+.muted { color:var(--muted); }
+ul { margin:6px 0; padding-left:20px; }
+table { border-collapse:collapse; margin-top:8px; width:100%;
+  font-variant-numeric:tabular-nums; }
+td { padding:3px 0; border-bottom:1px solid var(--line); }
+td:last-child { text-align:right; }
+a { color:var(--accent); }
+footer { color:var(--muted); font-size:13px; margin-top:24px; }
+"""
+
+
+def render_html(now: dt.datetime, header: str, results: list[dict],
+                new: set[str] | None = None) -> str:
+    """A self-contained details page; the macOS alert's button opens it."""
+    from html import escape as e
+    new = new or set()
+    et = now.astimezone(ET)
+    cards = []
+    for x in results:
+        m, v, r = x["move"], x["verdict"], x["rating"]
+        cls = "up" if m.move_pct >= 0 else "down"
+        factors = "".join(
+            f"<tr><td>{e(k.capitalize())}</td>"
+            f"<td>{'n/a' if s is None else s}</td></tr>"
+            for k, s in r.factors.items())
+        news = "".join(
+            f"<li>{dt.datetime.fromtimestamp(h['ts'], ET):%m-%d %H:%M} "
+            + (f'<a href="{e(h["link"])}">{e(h["title"])}</a>'
+               if h.get("link") else e(h["title"]))
+            + f" <span class='muted'>— {e(h['publisher'])}</span></li>"
+            for h in v.catalysts)
+        cards.append(f"""
+<section class="card{' new' if m.symbol in new else ''}">
+  <div class="head">
+    <span class="sym">{e(m.symbol)}</span>
+    <span class="name">{e(m.name if m.name != m.symbol else '')}</span>
+    <span class="move {cls}">{m.move_pct:+.2f}%</span>
+    <span>${m.price:,.2f}</span>
+    {'<span class="tag">New</span>' if m.symbol in new else ''}
+    <span class="rating">{e(r.rating)} · {r.score:g}</span>
+  </div>
+  <div class="driver">{e(v.label)} <span class="muted">(confidence
+    {v.confidence}; news {v.news_score} vs flow {v.flow_score};
+    headline tone {e(v.news_tone)})</span></div>
+  <div class="muted">{m.move_sigma:.1f}σ move · {m.rel_volume:.1f}× usual
+    volume · β {round(m.beta, 2) + 0:.2f} to SPY</div>
+  <ul>{''.join(f'<li>{e(w)}</li>' for w in v.reasons) or '<li>—</li>'}</ul>
+  {f'<div class="driver">Headlines</div><ul>{news}</ul>' if news else ''}
+  <table>{factors}</table>
+</section>""")
+    body = "".join(cards) or "<p>No large moves right now.</p>"
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Market moves {et:%H:%M} ET</title><style>{HTML_STYLE}</style></head>
+<body><main>
+<h1>Large moves — {et:%a %b %d, %H:%M} ET</h1>
+<p class="meta">{e(header)}</p>
+{body}
+<footer>Factors are scored 0–100; missing data shows n/a and is left out of
+the score. Automated screen, not investment advice.</footer>
+</main></body></html>
+"""
+
+
 # ------------------------------------------------------------ alert output
 
 def load_state(path: str) -> dict:
@@ -1011,6 +1102,36 @@ def notify(title: str, body: str, subtitle: str = "",
         return f"failed: {e}"
 
 
+def mac_alert(title: str, text: str, open_path: str,
+              button: str = "Open details") -> None:
+    """A macOS alert whose button opens `open_path` (a click on an
+    osascript banner can only ever open Script Editor). Runs in the
+    background and closes itself after 4 minutes, before the next scan."""
+    script = [
+        "on run argv",
+        "set r to display dialog (item 2 of argv) with title (item 1 of argv)"
+        " buttons {\"Dismiss\", (item 4 of argv)} default button 2"
+        " with icon note giving up after 240",
+        "if button returned of r is (item 4 of argv) then "
+        "do shell script \"open \" & quoted form of (item 3 of argv)",
+        "end run",
+    ]
+    args = ["osascript"]
+    for line in script:
+        args += ["-e", line]
+    # Own session, so the alert outlives this run (and launchd's cleanup).
+    subprocess.Popen(args + [title, text, os.path.abspath(open_path), button],
+                     start_new_session=True, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+
+
+def mac_style() -> str:
+    """'alert' (default: one alert per scan with an Open details button)
+    or 'banner' (notification-centre banners; clickable only via
+    terminal-notifier), from MAC_NOTIFY."""
+    return os.environ.get("MAC_NOTIFY", "alert")
+
+
 def ps_quote(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
@@ -1044,15 +1165,30 @@ def signal_notification(x: dict) -> tuple[str, str, str]:
     return title, subtitle, body
 
 
-def notify_signals(fresh: list[dict], open_path: str) -> None:
-    for x in fresh[:MAX_NOTIFICATIONS]:
-        title, subtitle, body = signal_notification(x)
-        notify(title, body, subtitle, open_path)
-    rest = fresh[MAX_NOTIFICATIONS:]
+def notify_signals(fresh: list[dict], open_path: str) -> str:
+    return notify_items([signal_notification(x) for x in fresh], open_path)
+
+
+def notify_items(items: list[tuple[str, str, str]], open_path: str) -> str:
+    """Show (title, subtitle, body) signals. On macOS: one alert listing
+    them with an Open details button; elsewhere one banner each."""
+    if sys.platform == "darwin" and mac_style() == "alert":
+        shown = items[:6]
+        text = "\n\n".join(f"{t}\n{sub}\n{body}" for t, sub, body in shown)
+        if len(items) > len(shown):
+            text += f"\n\n…and {len(items) - len(shown)} more"
+        mac_alert(f"Market moves: {len(items)} new signal(s)", text,
+                  open_path)
+        return "macOS alert"
+    how = ""
+    for title, subtitle, body in items[:MAX_NOTIFICATIONS]:
+        how = notify(title, body, subtitle, open_path)
+    rest = items[MAX_NOTIFICATIONS:]
     if rest:
         notify(f"Market moves: {len(rest)} more signal(s)",
-               "\n".join(one_liner(x) for x in rest[:6]),
-               "Full details in reports/latest.md", open_path)
+               "\n".join(t for t, _, _ in rest[:6]),
+               "Full details in reports/latest.html", open_path)
+    return how
 
 
 def notify_error_once(message: str) -> None:
@@ -1063,9 +1199,14 @@ def notify_error_once(message: str) -> None:
     today = str(dt.datetime.now(ET).date())
     if state.get("error_notified") == today:
         return
-    notify("Market move scanner: scans failing", message[:200],
-           "Run: python3 scanner.py --diagnose",
-           os.path.join(REPORTS, "scanner.log"))
+    log = os.path.join(REPORTS, "scanner.log")
+    if sys.platform == "darwin" and mac_style() == "alert":
+        mac_alert("Market move scanner: scans failing",
+                  f"{message[:300]}\n\nTo check the data sources, run:\n"
+                  "python3 scanner.py --diagnose", log, "Open log")
+    else:
+        notify("Market move scanner: scans failing", message[:200],
+               "Run: python3 scanner.py --diagnose", log)
     state["error_notified"] = today
     save_json(path, state)
 
@@ -1080,14 +1221,17 @@ def run_once(force: bool, alert: bool) -> None:
         return
     print(report, flush=True)
     os.makedirs(REPORTS, exist_ok=True)
-    latest = os.path.join(REPORTS, "latest.md")
-    with open(latest, "w") as f:
+    with open(os.path.join(REPORTS, "latest.md"), "w") as f:
         f.write(report + "\n")
 
     state_path = os.path.join(REPORTS, ".state.json")
     state = load_state(state_path)
     today = str(now.astimezone(ET).date())
     fresh = new_signals(results, state, today)
+    latest = os.path.join(REPORTS, "latest.html")
+    with open(latest, "w", encoding="utf-8") as f:
+        f.write(render_html(now, report.splitlines()[1], results,
+                            {x["move"].symbol for x in fresh}))
     state.pop("error_notified", None)  # a scan worked: re-arm error alerts
     with open(state_path, "w") as f:
         json.dump(state, f)
@@ -1145,6 +1289,7 @@ def install() -> None:
   <key>ProgramArguments</key>
   <array><string>{py}</string><string>{script}</string></array>
   <key>StartInterval</key><integer>300</integer>
+  <key>AbandonProcessGroup</key><true/>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
@@ -1188,6 +1333,24 @@ def uninstall() -> None:
     print("Schedule removed.")
 
 
+def sample_page() -> str:
+    """Details page for --test-notification, built from made-up data."""
+    import types
+    m = types.SimpleNamespace(
+        symbol="NVDA", name="NVIDIA Corp (sample)", move_pct=-4.9,
+        price=118.20, move_sigma=2.7, rel_volume=1.8, beta=1.6)
+    v = Verdict("Automated/flow-driven selling", 90, 10, 70, "none",
+                ["no catalyst headlines found",
+                 "steady, evenly sized bars (execution-algo footprint)",
+                 "heavy but evenly spread volume (TWAP/VWAP-style)"], [])
+    r = Rating("Buy", 64.5, {"catalyst": 80, "momentum": 65,
+                             "valuation": None, "analyst": None,
+                             "technical": 60, "risk": 65})
+    return render_html(dt.datetime.now(ET), "Sample data — this is what "
+                       "the Open details button shows after a real scan.",
+                       [{"move": m, "verdict": v, "rating": r}], {"NVDA"})
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--force", action="store_true",
@@ -1209,10 +1372,15 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.test_notification:
-        how = notify("NVDA -4.9% → Buy", "No catalyst headlines found; "
-                     "steady, evenly sized bars (execution-algo footprint)",
-                     "Automated selling · $118.20 · score 64.5 (sample)",
-                     os.path.join(REPORTS, "latest.md"))
+        os.makedirs(REPORTS, exist_ok=True)
+        sample = os.path.join(REPORTS, "sample.html")
+        with open(sample, "w", encoding="utf-8") as f:
+            f.write(sample_page())
+        how = notify_items([(
+            "NVDA -4.9% → Buy",
+            "Automated selling · $118.20 · score 64.5 (sample)",
+            "No catalyst headlines found; steady, evenly sized bars "
+            "(execution-algo footprint)")], sample)
         print(f"Sent a sample notification via {how}.")
         print("If none appeared, see 'Notifications' in README.md.")
         return 0
