@@ -272,13 +272,15 @@ class MacNotifyCommandTests(unittest.TestCase):
         s.subprocess.run, s.sys.platform = self._run, self._plat
         s._mac_notifier = self._which
 
-    def test_osascript_fallback_escapes_quotes(self):
+    def test_osascript_passes_text_as_arguments(self):
         s._mac_notifier = lambda: None
-        s.notify('A "quoted" title', "body", "sub", "/tmp/x.md")
+        title, body = 'NVDA -4.9% → Buy "quoted"', "a · b \\ c"
+        s.notify(title, body, "sub", "/tmp/x.md")
         cmd = self.cmds[0]
-        self.assertEqual(cmd[:2], ["osascript", "-e"])
-        self.assertIn('with title "A \\"quoted\\" title"', cmd[2])
-        self.assertIn('subtitle "sub"', cmd[2])
+        self.assertEqual(cmd[0], "osascript")
+        self.assertEqual(cmd[-3:], [title, body, "sub"])
+        script = " ".join(c for c in cmd[1:-3] if c != "-e")
+        self.assertNotIn("NVDA", script)  # text never enters the script
 
     def test_terminal_notifier_opens_report(self):
         s._mac_notifier = lambda: "/opt/homebrew/bin/terminal-notifier"

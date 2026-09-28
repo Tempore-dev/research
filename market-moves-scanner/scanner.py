@@ -970,14 +970,16 @@ def notify(title: str, body: str, subtitle: str = "",
                 return ran(tn, subprocess.run(cmd, timeout=10,
                                               capture_output=True))
             else:
-                script = (f"display notification {json.dumps(body)} "
-                          f"with title {json.dumps(title)}"
-                          + (f" subtitle {json.dumps(subtitle)}"
-                             if subtitle else "")
-                          + ' sound name "default"')
+                # Text goes in as arguments, never spliced into the script,
+                # so quotes and symbols like → need no AppleScript escaping.
                 return ran("osascript", subprocess.run(
-                    ["osascript", "-e", script], timeout=10,
-                    capture_output=True))
+                    ["osascript",
+                     "-e", "on run argv",
+                     "-e", "display notification (item 2 of argv) with title "
+                           "(item 1 of argv) subtitle (item 3 of argv) "
+                           'sound name "default"',
+                     "-e", "end run", title, body, subtitle],
+                    timeout=10, capture_output=True))
         elif sys.platform.startswith("win"):
             text = f"{subtitle}\n{body}" if subtitle else body
             ps = (
