@@ -289,6 +289,16 @@ class MacNotifyCommandTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-open") + 1], "file:///tmp/r%20e.md")
         self.assertEqual(cmd[cmd.index("-subtitle") + 1], "S")
 
+    def test_refused_terminal_notifier_falls_back_to_osascript(self):
+        class Refused:
+            returncode, stderr = 3, b"Notifications are not allowed"
+        s._mac_notifier = lambda: "/opt/homebrew/bin/terminal-notifier"
+        s.subprocess.run = lambda cmd, **k: (self.cmds.append(cmd),
+                                             Refused())[1]
+        s.notify("T", "B", "S", "/tmp/r.md")
+        self.assertEqual([c[0] for c in self.cmds],
+                         ["/opt/homebrew/bin/terminal-notifier", "osascript"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,7 +58,7 @@ If scheduled scans start failing (bad keys, no internet), you get one "scans fai
   3. In System Settings → Notifications → **Script Editor**, turn on *Allow notifications* and choose the **Alerts** style so they stay on screen until you dismiss them.
   4. Run `python3 scanner.py --test-notification` again.
 
-  Or install terminal-notifier (`brew install terminal-notifier`): it asks for permission under its own name, and clicking its notifications opens `reports/latest.md`. The scanner uses it automatically when it's installed.
+  Clicking a Script Editor notification opens Script Editor; macOS doesn't let a script choose what a click does. To make clicks open `reports/latest.md`, install terminal-notifier (`brew install terminal-notifier`), which the scanner uses automatically. It needs its own permission: if the test prints `Notifications are not allowed for this application`, open System Settings → Notifications → **terminal-notifier**, turn on *Allow notifications*, and choose **Alerts**. Until then the scanner falls back to Script Editor notifications, so no alert is lost.
 - **Linux:** uses `notify-send` (package `libnotify-bin` on Debian/Ubuntu). It works from cron too.
 - **Windows:** shows a system-tray balloon.
 

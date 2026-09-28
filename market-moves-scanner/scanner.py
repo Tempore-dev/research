@@ -967,19 +967,22 @@ def notify(title: str, body: str, subtitle: str = "",
                 if open_path:
                     cmd += ["-open", "file://" + urllib.parse.quote(
                         os.path.abspath(open_path))]
-                return ran(tn, subprocess.run(cmd, timeout=10,
-                                              capture_output=True))
-            else:
-                # Text goes in as arguments, never spliced into the script,
-                # so quotes and symbols like → need no AppleScript escaping.
-                return ran("osascript", subprocess.run(
-                    ["osascript",
-                     "-e", "on run argv",
-                     "-e", "display notification (item 2 of argv) with title "
-                           "(item 1 of argv) subtitle (item 3 of argv) "
-                           'sound name "default"',
-                     "-e", "end run", title, body, subtitle],
-                    timeout=10, capture_output=True))
+                p = subprocess.run(cmd, timeout=10, capture_output=True)
+                how = ran(tn, p)
+                if not getattr(p, "returncode", 0):
+                    return how
+                # Not permitted (or broken): fall back to osascript so the
+                # alert still arrives, just without click-to-open.
+            # Text goes in as arguments, never spliced into the script,
+            # so quotes and symbols like → need no AppleScript escaping.
+            return ran("osascript", subprocess.run(
+                ["osascript",
+                 "-e", "on run argv",
+                 "-e", "display notification (item 2 of argv) with title "
+                       "(item 1 of argv) subtitle (item 3 of argv) "
+                       'sound name "default"',
+                 "-e", "end run", title, body, subtitle],
+                timeout=10, capture_output=True))
         elif sys.platform.startswith("win"):
             text = f"{subtitle}\n{body}" if subtitle else body
             ps = (
