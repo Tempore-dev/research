@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Large-move scanner for the most traded US stocks.
 
-Every run (scheduled every 5 minutes by .github/workflows/market-moves.yml):
+Runs on your own computer, every 5 minutes during US market hours
+(install the schedule with `python3 scanner.py --install`). Each run:
 
 1. Pull Yahoo Finance's "most actives" list (fallback: a fixed list of
    habitually high-volume tickers).
@@ -14,9 +15,8 @@ Every run (scheduled every 5 minutes by .github/workflows/market-moves.yml):
 4. Rate it Strong Buy / Buy / Hold on a multi-factor composite of the kind
    fundamental hedge funds use: catalyst quality, momentum, valuation,
    analyst consensus, technicals and liquidity/risk.
-5. Write a Markdown report (stdout, and the Actions job summary) and, when
-   running in GitHub Actions, post new or changed signals as a comment on a
-   "Market move alerts" issue.
+5. Write reports/latest.md (full snapshot), append new or changed signals
+   to reports/<date>.md, and pop a desktop notification for them.
 
 Standard library only. Not investment advice.
 """
@@ -30,14 +30,51 @@ import json
 import math
 import os
 import re
+import shlex
+import shutil
 import statistics
+import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
-ET = ZoneInfo("America/New_York")
+
+
+class _USEastern(dt.tzinfo):
+    """US Eastern time with current DST rules, for systems without a tz
+    database (Windows without the tzdata package)."""
+
+    def _dst_window(self, year: int) -> tuple[dt.datetime, dt.datetime]:
+        mar = dt.datetime(year, 3, 8)   # second Sunday of March, 2am
+        nov = dt.datetime(year, 11, 1)  # first Sunday of November, 2am
+        return (mar + dt.timedelta(days=(6 - mar.weekday()) % 7, hours=2),
+                nov + dt.timedelta(days=(6 - nov.weekday()) % 7, hours=2))
+
+    def dst(self, d):
+        start, end = self._dst_window(d.year)
+        naive = d.replace(tzinfo=None)
+        return dt.timedelta(hours=1 if start <= naive < end else 0)
+
+    def utcoffset(self, d):
+        return dt.timedelta(hours=-5) + self.dst(d)
+
+    def tzname(self, d):
+        return "EDT" if self.dst(d) else "EST"
+
+    def fromutc(self, d):
+        start, end = self._dst_window(d.year)
+        naive = d.replace(tzinfo=None)
+        summer = start + dt.timedelta(hours=5) <= naive < end + dt.timedelta(hours=4)
+        return d + dt.timedelta(hours=-4 if summer else -5)
+
+
+try:
+    ET = ZoneInfo("America/New_York")
+except Exception:
+    ET = _USEastern()
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
@@ -45,6 +82,9 @@ TOP_N = int(os.environ.get("TOP_N", "25"))
 MOVE_PCT = float(os.environ.get("MOVE_PCT", "3.0"))      # % vs prior close
 MOVE_SIGMA = float(os.environ.get("MOVE_SIGMA", "2.0"))  # daily std devs
 NEWS_LOOKBACK_H = 18                                     # covers overnight
+REPORTS = os.environ.get(
+    "REPORTS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "reports"))
 
 FALLBACK_TICKERS = [
     "NVDA", "TSLA", "AAPL", "AMD", "PLTR", "AMZN", "MSFT", "META", "GOOGL",
@@ -545,11 +585,14 @@ def rate(m: Move, v: Verdict, q: dict, daily: Bars) -> Rating:
 
 # ------------------------------------------------------------------- runner
 
-def market_open(now: dt.datetime, spy: Bars) -> bool:
+def in_session_window(now: dt.datetime) -> bool:
     et = now.astimezone(ET)
-    if et.weekday() >= 5:
-        return False
-    if not (dt.time(9, 35) <= et.time() <= dt.time(16, 5)):
+    return (et.weekday() < 5
+            and dt.time(9, 35) <= et.time() <= dt.time(16, 5))
+
+
+def market_open(now: dt.datetime, spy: Bars) -> bool:
+    if not in_session_window(now):
         return False
     # Holidays: no fresh SPY bar today.
     return bool(spy.ts) and now.timestamp() - spy.ts[-1] < 20 * 60
@@ -672,57 +715,164 @@ def new_signals(results: list[dict], state: dict, today: str) -> list[dict]:
     return fresh
 
 
-def gh(method: str, path: str, body: dict | None = None) -> dict | list:
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}{path}",
-        method=method, data=json.dumps(body).encode() if body else None,
-        headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-                 "Accept": "application/vnd.github+json",
-                 "User-Agent": "market-moves-scanner"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read() or b"{}")
+def notify(title: str, body: str) -> None:
+    """Best-effort desktop notification on macOS, Linux or Windows."""
+    try:
+        if sys.platform == "darwin":
+            script = (f"display notification {json.dumps(body)} "
+                      f"with title {json.dumps(title)}")
+            subprocess.run(["osascript", "-e", script], timeout=10)
+        elif sys.platform.startswith("win"):
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms;"
+                "$n=New-Object System.Windows.Forms.NotifyIcon;"
+                "$n.Icon=[System.Drawing.SystemIcons]::Information;"
+                "$n.Visible=$true;"
+                f"$n.ShowBalloonTip(10000,{ps_quote(title)},{ps_quote(body)},"
+                "'Info');Start-Sleep 11;$n.Dispose()")
+            subprocess.Popen(["powershell", "-NoProfile", "-Command", ps],
+                             creationflags=0x08000000)  # no console window
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, body], timeout=10)
+    except Exception as e:
+        print(f"warn: notification failed: {e}", file=sys.stderr)
 
 
-def post_alert(markdown: str) -> None:
-    title = "Market move alerts"
-    issues = gh("GET", "/issues?state=open&creator=github-actions%5Bbot%5D"
-                       "&per_page=100")
-    num = next((i["number"] for i in issues if i["title"] == title), None)
-    if num is None:
-        num = gh("POST", "/issues", {
-            "title": title,
-            "body": "New large-move signals from the 5-minute scanner are "
-                    "posted here as comments. Subscribe to get notified."
-        })["number"]
-    gh("POST", f"/issues/{num}/comments", {"body": markdown})
+def ps_quote(s: str) -> str:
+    return "'" + s.replace("'", "''") + "'"
+
+
+def one_liner(x: dict) -> str:
+    m, v, r = x["move"], x["verdict"], x["rating"]
+    driver = "news" if v.label == "News-driven" else (
+        "automated" if v.label.startswith("Automated") else "mixed")
+    return f"{m.symbol} {m.move_pct:+.1f}% ({driver}) → {r.rating}"
+
+
+def run_once(force: bool, alert: bool) -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    if not force and not in_session_window(now):
+        return  # cheap exit, no network, for scheduler ticks off-hours
+    report, results = scan(now, force)
+    if not report:
+        print("Market closed — nothing to do.")
+        return
+    print(report, flush=True)
+    os.makedirs(REPORTS, exist_ok=True)
+    with open(os.path.join(REPORTS, "latest.md"), "w") as f:
+        f.write(report + "\n")
+
+    state_path = os.path.join(REPORTS, ".state.json")
+    state = load_state(state_path)
+    today = str(now.astimezone(ET).date())
+    fresh = new_signals(results, state, today)
+    with open(state_path, "w") as f:
+        json.dump(state, f)
+    if fresh:
+        with open(os.path.join(REPORTS, f"{today}.md"), "a") as f:
+            f.write(render(now, f"{len(fresh)} new or changed signal(s).",
+                           fresh) + "\n\n")
+        if alert:
+            notify(f"Market moves: {len(fresh)} new signal(s)",
+                   "\n".join(one_liner(x) for x in fresh[:5]))
+
+
+# --------------------------------------------------------------- scheduling
+
+TASK = "com.tempore.market-moves"
+PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{TASK}.plist")
+CRON_TAG = "# market-moves-scanner"
+
+
+def install() -> None:
+    py, script = sys.executable, os.path.abspath(__file__)
+    log = os.path.join(REPORTS, "scanner.log")
+    os.makedirs(REPORTS, exist_ok=True)
+    if sys.platform == "darwin":
+        os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+        with open(PLIST, "w") as f:
+            f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{TASK}</string>
+  <key>ProgramArguments</key>
+  <array><string>{py}</string><string>{script}</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+""")
+        subprocess.run(["launchctl", "unload", PLIST], capture_output=True)
+        subprocess.run(["launchctl", "load", PLIST], check=True)
+        print(f"Installed launchd agent {PLIST}")
+    elif sys.platform.startswith("win"):
+        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+        exe = pyw if os.path.exists(pyw) else py
+        subprocess.run(["schtasks", "/Create", "/F", "/SC", "MINUTE",
+                        "/MO", "5", "/TN", "MarketMoveScanner",
+                        "/TR", f'"{exe}" "{script}"'], check=True)
+        print("Installed Task Scheduler task MarketMoveScanner")
+    else:
+        line = (f"*/5 * * * 1-5 {shlex.quote(py)} {shlex.quote(script)} "
+                f">> {shlex.quote(log)} 2>&1 {CRON_TAG}")
+        cur = subprocess.run(["crontab", "-l"], capture_output=True,
+                             text=True).stdout
+        keep = [ln for ln in cur.splitlines() if CRON_TAG not in ln]
+        subprocess.run(["crontab", "-"], input="\n".join(keep + [line])
+                       + "\n", text=True, check=True)
+        print("Installed crontab entry:\n  " + line)
+    print(f"Reports: {REPORTS}")
+
+
+def uninstall() -> None:
+    if sys.platform == "darwin":
+        subprocess.run(["launchctl", "unload", PLIST], capture_output=True)
+        if os.path.exists(PLIST):
+            os.remove(PLIST)
+    elif sys.platform.startswith("win"):
+        subprocess.run(["schtasks", "/Delete", "/F", "/TN",
+                        "MarketMoveScanner"])
+    else:
+        cur = subprocess.run(["crontab", "-l"], capture_output=True,
+                             text=True).stdout
+        keep = [ln for ln in cur.splitlines() if CRON_TAG not in ln]
+        subprocess.run(["crontab", "-"], input="\n".join(keep) + "\n",
+                       text=True, check=True)
+    print("Schedule removed.")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--force", action="store_true",
                     help="run even when the market is closed")
-    ap.add_argument("--state", default=".scanner-state.json")
-    ap.add_argument("--no-alert", action="store_true")
+    ap.add_argument("--no-alert", action="store_true",
+                    help="skip desktop notifications")
+    ap.add_argument("--every", type=float, metavar="MIN",
+                    help="stay running and scan every MIN minutes")
+    ap.add_argument("--install", action="store_true",
+                    help="schedule a scan every 5 minutes on this computer")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="remove the schedule")
     args = ap.parse_args()
 
-    now = dt.datetime.now(dt.timezone.utc)
-    report, results = scan(now, args.force)
-    if not report:
-        print("Market closed — nothing to do.")
+    if args.install:
+        install()
         return 0
-    print(report)
-    if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
-        with open(summary, "a") as f:
-            f.write(report + "\n")
-
-    state = load_state(args.state)
-    fresh = new_signals(results, state, str(now.astimezone(ET).date()))
-    with open(args.state, "w") as f:
-        json.dump(state, f)
-    if fresh and not args.no_alert and os.environ.get("GITHUB_TOKEN"):
-        post_alert(render(now, f"{len(fresh)} new or changed signal(s).",
-                          fresh))
-    return 0
+    if args.uninstall:
+        uninstall()
+        return 0
+    while True:
+        try:
+            run_once(args.force, not args.no_alert)
+        except Exception as e:  # network down, Yahoo changed, etc.
+            stamp = f"{dt.datetime.now(ET):%Y-%m-%d %H:%M}"
+            print(f"{stamp} error: {e}", file=sys.stderr, flush=True)
+            if not args.every:
+                return 1
+        if not args.every:
+            return 0
+        period = args.every * 60
+        time.sleep(period - time.time() % period + 2)  # align to the clock
 
 
 if __name__ == "__main__":

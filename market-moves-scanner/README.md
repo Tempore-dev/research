@@ -1,14 +1,39 @@
 # Market move scanner
 
-A GitHub Actions job ([`.github/workflows/market-moves.yml`](../.github/workflows/market-moves.yml)) runs [`scanner.py`](scanner.py) every 5 minutes during US market hours. Each run:
+[`scanner.py`](scanner.py) runs on your own computer every 5 minutes during US market hours (9:30–16:00 ET, weekdays). Each run:
 
 1. Takes the 25 most traded US stocks (Yahoo Finance "most actives").
 2. Flags large moves: at least 3% from the prior close, or at least 2 daily standard deviations.
 3. Decides whether each move is **news-driven** or **automated / flow-driven selling (or buying)**.
 4. Rates the stock **Strong Buy**, **Buy** or **Hold**.
-5. Writes the full table to the run's job summary. New or changed signals are posted as a comment on the **Market move alerts** issue. Subscribe to that issue to get notified.
+5. Saves the results and alerts you:
+   - `reports/latest.md`: the full table from the latest run.
+   - `reports/<date>.md`: new or changed signals only.
+   - A desktop notification for each batch of new signals.
 
-Standard library only. Not investment advice.
+It needs only Python 3.9 or later: no packages, accounts or API keys. Not investment advice.
+
+## Setup
+
+```sh
+git clone https://github.com/Tempore-dev/research && cd research/market-moves-scanner
+python3 scanner.py --force --no-alert   # one test run, even if the market is closed
+python3 scanner.py --install            # scan every 5 minutes from now on
+```
+
+`--install` uses your operating system's own scheduler:
+
+| OS | Scheduler | Remove with |
+|---|---|---|
+| macOS | launchd agent `~/Library/LaunchAgents/com.tempore.market-moves.plist` | `python3 scanner.py --uninstall` |
+| Linux | a `crontab` line tagged `# market-moves-scanner` (weekdays, every 5 min) | `python3 scanner.py --uninstall` |
+| Windows | Task Scheduler task `MarketMoveScanner` (use `py scanner.py --install`) | `py scanner.py --uninstall` |
+
+The scheduler fires every 5 minutes. Outside market hours the script exits at once without touching the network, and on holidays it exits after a single price check. Run output and errors go to `reports/scanner.log`.
+
+The computer has to be awake for scans to run. If you'd rather keep it in a terminal window than install a schedule, run `python3 scanner.py --every 5`.
+
+Linux notifications use `notify-send` (package `libnotify-bin` on Debian/Ubuntu). On macOS, the first notification may ask you to allow alerts from Script Editor.
 
 ## News vs automated selling
 
@@ -38,15 +63,15 @@ The rating is a weighted composite of six factors, each scored 0 to 100. These a
 
 A score of 68 or more with catalyst ≥ 60 rates **Strong Buy**. A score of 56 or more rates **Buy**. Everything else rates **Hold**. A news-driven drop on negative headlines is always **Hold**.
 
-## Running and tuning
+## Options
 
-- **Run it now:** Actions tab → *Market move scanner* → *Run workflow*. Tick *force* to run outside market hours.
-- **Run locally:** `python3 scanner.py --force --no-alert`
-- **Tests:** `python3 -m unittest test_scanner.py` (offline, synthetic data)
-- **Thresholds:** set the `TOP_N`, `MOVE_PCT` and `MOVE_SIGMA` environment variables in the workflow.
+- `--force`: run even when the market is closed (uses the last session's data).
+- `--no-alert`: skip desktop notifications.
+- `--every MIN`: keep running and scan every MIN minutes.
+- **Thresholds:** set the `TOP_N`, `MOVE_PCT` and `MOVE_SIGMA` environment variables. `REPORTS_DIR` moves the reports folder.
+- **Tests:** `python3 -m unittest test_scanner.py` (offline, synthetic data).
 
 ## Limits
 
 - Yahoo Finance's endpoints are unofficial and can change or rate-limit without notice. If the most-actives list fails, the scanner falls back to a fixed list of high-volume tickers.
-- GitHub can delay scheduled runs by several minutes when runners are busy. It also disables scheduled workflows after 60 days with no repository activity.
-- Each run bills at least one Actions minute. That comes to about 80 minutes per trading day, or roughly 1,700 a month. This is free on public repositories but counts against the monthly quota on private ones.
+- Scans only run while the computer is on and awake. A sleeping laptop misses them.
