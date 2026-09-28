@@ -208,5 +208,85 @@ class AlpacaScanTests(unittest.TestCase):
                                          tzinfo=dt.timezone.utc).timestamp()))
 
 
+class NotificationTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._reports, s.REPORTS = s.REPORTS, tempfile.mkdtemp()
+        self._notify, self.sent = s.notify, []
+        s.notify = lambda *a: self.sent.append(a)
+
+    def tearDown(self):
+        s.REPORTS, s.notify = self._reports, self._notify
+
+    def signal(self, sym, move=-4.9, label="Automated/flow-driven selling"):
+        m = s.analyse_move(sym, sym, bars([100 + move] * 10,
+                                          first_open=100 + move),
+                           daily(), FLAT_SPY, 100.0, 5e7, NOW)
+        v = s.Verdict(label, 80, 10, 70, "none",
+                      ["no catalyst headlines found"], [])
+        return {"move": m, "verdict": v,
+                "rating": s.Rating("Buy", 64.5, {})}
+
+    def test_one_notification_per_signal(self):
+        s.notify_signals([self.signal("ABC")], "latest.md")
+        title, body, subtitle, path = self.sent[0]
+        self.assertEqual(title, "ABC -4.9% → Buy")
+        self.assertTrue(subtitle.startswith("Automated selling · $95.10"))
+        self.assertEqual(body, "no catalyst headlines found")
+        self.assertEqual(path, "latest.md")
+
+    def test_news_signal_shows_headline(self):
+        x = self.signal("XYZ", label="News-driven")
+        x["verdict"].news_tone = "negative"
+        x["verdict"].catalysts = [{"title": "XYZ cuts guidance", "ts": 0}]
+        s.notify_signals([x], "latest.md")
+        self.assertEqual(self.sent[0][1], "XYZ cuts guidance")
+        self.assertIn("News-driven (negative news)", self.sent[0][2])
+
+    def test_overflow_is_summarised(self):
+        s.notify_signals([self.signal(f"S{i}") for i in range(7)], "l.md")
+        self.assertEqual(len(self.sent), s.MAX_NOTIFICATIONS + 1)
+        self.assertIn("3 more", self.sent[-1][0])
+
+    def test_error_alert_once_per_day_and_rearmed(self):
+        s.notify_error_once("HTTP 401")
+        s.notify_error_once("HTTP 401")
+        self.assertEqual(len(self.sent), 1)
+        state_path = s.os.path.join(s.REPORTS, ".state.json")
+        state = s.load_state(state_path)
+        state.pop("error_notified")  # what a successful run does
+        s.save_json(state_path, state)
+        s.notify_error_once("HTTP 401")
+        self.assertEqual(len(self.sent), 2)
+
+
+class MacNotifyCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.cmds = []
+        self._run, self._plat = s.subprocess.run, s.sys.platform
+        self._which = s._mac_notifier
+        s.subprocess.run = lambda cmd, **k: self.cmds.append(cmd)
+        s.sys.platform = "darwin"
+
+    def tearDown(self):
+        s.subprocess.run, s.sys.platform = self._run, self._plat
+        s._mac_notifier = self._which
+
+    def test_osascript_fallback_escapes_quotes(self):
+        s._mac_notifier = lambda: None
+        s.notify('A "quoted" title', "body", "sub", "/tmp/x.md")
+        cmd = self.cmds[0]
+        self.assertEqual(cmd[:2], ["osascript", "-e"])
+        self.assertIn('with title "A \\"quoted\\" title"', cmd[2])
+        self.assertIn('subtitle "sub"', cmd[2])
+
+    def test_terminal_notifier_opens_report(self):
+        s._mac_notifier = lambda: "/opt/homebrew/bin/terminal-notifier"
+        s.notify("T", "B", "S", "/tmp/r e.md")
+        cmd = self.cmds[0]
+        self.assertEqual(cmd[cmd.index("-open") + 1], "file:///tmp/r%20e.md")
+        self.assertEqual(cmd[cmd.index("-subtitle") + 1], "S")
+
+
 if __name__ == "__main__":
     unittest.main()

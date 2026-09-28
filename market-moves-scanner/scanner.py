@@ -933,25 +933,60 @@ def new_signals(results: list[dict], state: dict, today: str) -> list[dict]:
     return fresh
 
 
-def notify(title: str, body: str) -> None:
-    """Best-effort desktop notification on macOS, Linux or Windows."""
+def _mac_notifier() -> str | None:
+    """terminal-notifier, if installed (Homebrew isn't on launchd's PATH)."""
+    for p in (shutil.which("terminal-notifier"),
+              "/opt/homebrew/bin/terminal-notifier",
+              "/usr/local/bin/terminal-notifier"):
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def notify(title: str, body: str, subtitle: str = "",
+           open_path: str | None = None) -> None:
+    """Best-effort desktop notification on macOS, Linux or Windows.
+    With terminal-notifier on macOS, clicking it opens `open_path`."""
     try:
         if sys.platform == "darwin":
-            script = (f"display notification {json.dumps(body)} "
-                      f"with title {json.dumps(title)}")
-            subprocess.run(["osascript", "-e", script], timeout=10)
+            tn = _mac_notifier()
+            if tn:
+                cmd = [tn, "-title", title, "-message", body,
+                       "-group", f"market-moves-{title}", "-sound", "default"]
+                if subtitle:
+                    cmd += ["-subtitle", subtitle]
+                if open_path:
+                    cmd += ["-open", "file://" + urllib.parse.quote(
+                        os.path.abspath(open_path))]
+                subprocess.run(cmd, timeout=10, capture_output=True)
+            else:
+                script = (f"display notification {json.dumps(body)} "
+                          f"with title {json.dumps(title)}"
+                          + (f" subtitle {json.dumps(subtitle)}"
+                             if subtitle else "")
+                          + ' sound name "default"')
+                subprocess.run(["osascript", "-e", script], timeout=10,
+                               capture_output=True)
         elif sys.platform.startswith("win"):
+            text = f"{subtitle}\n{body}" if subtitle else body
             ps = (
                 "Add-Type -AssemblyName System.Windows.Forms;"
                 "$n=New-Object System.Windows.Forms.NotifyIcon;"
                 "$n.Icon=[System.Drawing.SystemIcons]::Information;"
                 "$n.Visible=$true;"
-                f"$n.ShowBalloonTip(10000,{ps_quote(title)},{ps_quote(body)},"
+                f"$n.ShowBalloonTip(10000,{ps_quote(title)},{ps_quote(text)},"
                 "'Info');Start-Sleep 11;$n.Dispose()")
             subprocess.Popen(["powershell", "-NoProfile", "-Command", ps],
                              creationflags=0x08000000)  # no console window
         elif shutil.which("notify-send"):
-            subprocess.run(["notify-send", title, body], timeout=10)
+            env = dict(os.environ)
+            # cron has no desktop session variables; point at the user's bus.
+            bus = f"/run/user/{os.getuid()}/bus"
+            if "DBUS_SESSION_BUS_ADDRESS" not in env and os.path.exists(bus):
+                env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+            text = f"{subtitle}\n{body}" if subtitle else body
+            subprocess.run(["notify-send", "-a", "Market moves", title, text],
+                           timeout=10, env=env)
     except Exception as e:
         print(f"warn: notification failed: {e}", file=sys.stderr)
 
@@ -967,6 +1002,54 @@ def one_liner(x: dict) -> str:
     return f"{m.symbol} {m.move_pct:+.1f}% ({driver}) → {r.rating}"
 
 
+MAX_NOTIFICATIONS = 4  # per scan; the rest are summarised in one more
+
+
+def signal_notification(x: dict) -> tuple[str, str, str]:
+    """(title, subtitle, body) for one signal, e.g.
+    title "NVDA −4.9% → Buy", subtitle "Automated selling · no news",
+    body: the top catalyst headline, or the strongest evidence."""
+    m, v, r = x["move"], x["verdict"], x["rating"]
+    title = f"{m.symbol} {m.move_pct:+.1f}% → {r.rating}"
+    if v.label == "News-driven":
+        driver = f"News-driven ({v.news_tone} news)"
+    elif v.label.startswith("Automated"):
+        driver = ("Automated selling" if m.move_pct < 0
+                  else "Automated buying")
+    else:
+        driver = "Mixed / unclear driver"
+    subtitle = f"{driver} · ${m.price:,.2f} · score {r.score:g}"
+    body = (v.catalysts[0]["title"] if v.catalysts
+            else "; ".join(v.reasons[:2]) or m.name)
+    return title, subtitle, body
+
+
+def notify_signals(fresh: list[dict], open_path: str) -> None:
+    for x in fresh[:MAX_NOTIFICATIONS]:
+        title, subtitle, body = signal_notification(x)
+        notify(title, body, subtitle, open_path)
+    rest = fresh[MAX_NOTIFICATIONS:]
+    if rest:
+        notify(f"Market moves: {len(rest)} more signal(s)",
+               "\n".join(one_liner(x) for x in rest[:6]),
+               "Full details in reports/latest.md", open_path)
+
+
+def notify_error_once(message: str) -> None:
+    """Tell the user a scheduled scan is failing, at most once a day, so a
+    broken setup doesn't go unnoticed when nobody watches the terminal."""
+    path = os.path.join(REPORTS, ".state.json")
+    state = load_state(path)
+    today = str(dt.datetime.now(ET).date())
+    if state.get("error_notified") == today:
+        return
+    notify("Market move scanner: scans failing", message[:200],
+           "Run: python3 scanner.py --diagnose",
+           os.path.join(REPORTS, "scanner.log"))
+    state["error_notified"] = today
+    save_json(path, state)
+
+
 def run_once(force: bool, alert: bool) -> None:
     now = dt.datetime.now(dt.timezone.utc)
     if not force and not in_session_window(now):
@@ -977,13 +1060,15 @@ def run_once(force: bool, alert: bool) -> None:
         return
     print(report, flush=True)
     os.makedirs(REPORTS, exist_ok=True)
-    with open(os.path.join(REPORTS, "latest.md"), "w") as f:
+    latest = os.path.join(REPORTS, "latest.md")
+    with open(latest, "w") as f:
         f.write(report + "\n")
 
     state_path = os.path.join(REPORTS, ".state.json")
     state = load_state(state_path)
     today = str(now.astimezone(ET).date())
     fresh = new_signals(results, state, today)
+    state.pop("error_notified", None)  # a scan worked: re-arm error alerts
     with open(state_path, "w") as f:
         json.dump(state, f)
     if fresh:
@@ -991,8 +1076,7 @@ def run_once(force: bool, alert: bool) -> None:
             f.write(render(now, f"{len(fresh)} new or changed signal(s).",
                            fresh) + "\n\n")
         if alert:
-            notify(f"Market moves: {len(fresh)} new signal(s)",
-                   "\n".join(one_liner(x) for x in fresh[:5]))
+            notify_signals(fresh, latest)
 
 
 def setup() -> None:
@@ -1100,7 +1184,18 @@ def main() -> int:
                     help="test the data sources and print what works")
     ap.add_argument("--setup", action="store_true",
                     help="enter and save your Alpaca API keys")
+    ap.add_argument("--test-notification", action="store_true",
+                    help="show a sample notification")
     args = ap.parse_args()
+
+    if args.test_notification:
+        notify("NVDA -4.9% → Buy", "No catalyst headlines found; steady, "
+               "evenly sized bars (execution-algo footprint)",
+               "Automated selling · $118.20 · score 64.5 (sample)",
+               os.path.join(REPORTS, "latest.md"))
+        print("Sent a sample notification. If none appeared, see "
+              "'Notifications' in README.md.")
+        return 0
 
     if args.setup:
         setup()
@@ -1119,9 +1214,11 @@ def main() -> int:
     while True:
         try:
             run_once(args.force, not args.no_alert)
-        except Exception as e:  # network down, Yahoo changed, etc.
+        except (Exception, SystemExit) as e:  # network down, bad keys...
             stamp = f"{dt.datetime.now(ET):%Y-%m-%d %H:%M}"
             print(f"{stamp} error: {e}", file=sys.stderr, flush=True)
+            if not args.no_alert:
+                notify_error_once(str(e))
             if not args.every:
                 return 1
         if not args.every:

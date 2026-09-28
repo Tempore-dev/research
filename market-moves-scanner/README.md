@@ -9,7 +9,7 @@
 5. Saves the results and alerts you:
    - `reports/latest.md`: the full table from the latest run.
    - `reports/<date>.md`: new or changed signals only.
-   - A desktop notification for each batch of new signals.
+   - A desktop notification for each new signal, so you never have to check the terminal.
 
 It needs Python 3.9 or later and a free [Alpaca](https://alpaca.markets) account. No packages to install. Not investment advice.
 
@@ -38,7 +38,25 @@ The scheduler fires every 5 minutes. Outside market hours the script exits at on
 
 The computer has to be awake for scans to run. If you'd rather keep it in a terminal window than install a schedule, run `python3 scanner.py --every 5`.
 
-Linux notifications use `notify-send` (package `libnotify-bin` on Debian/Ubuntu). On macOS, the first notification may ask you to allow alerts from Script Editor.
+## Notifications
+
+You don't need to watch the terminal. Each new or changed signal gets its own desktop notification:
+
+> **NVDA −4.9% → Buy**
+> Automated selling · $118.20 · score 64.5
+> No catalyst headlines found; steady, evenly sized bars (execution-algo footprint)
+
+A news-driven move shows its top headline instead. A scan sends at most four notifications, and any further signals are summed up in one more. The same stock doesn't alert again that day unless its driver or rating changes, or the move grows by 2 more points. Scans that find nothing stay silent.
+
+If scheduled scans start failing (bad keys, no internet), you get one "scans failing" alert per day until a scan succeeds again.
+
+**Check that notifications reach you:** `python3 scanner.py --test-notification` shows a sample.
+
+- **macOS:** notifications appear as coming from **Script Editor**. If the sample doesn't show up, open System Settings → Notifications → Script Editor and allow notifications. Choose the **Alerts** style so they stay on screen until you dismiss them. For notifications you can click to open `reports/latest.md`, install terminal-notifier (`brew install terminal-notifier`). The scanner uses it automatically when it's installed.
+- **Linux:** uses `notify-send` (package `libnotify-bin` on Debian/Ubuntu). It works from cron too.
+- **Windows:** shows a system-tray balloon.
+
+`--no-alert` turns notifications off.
 
 ## News vs automated selling
 
@@ -86,6 +104,7 @@ A scan makes about 4 Alpaca requests. Daily bars are fetched once a day and cach
 
 - `--force`: run even when the market is closed (uses the last session's data).
 - `--no-alert`: skip desktop notifications.
+- `--test-notification`: show a sample notification.
 - `--every MIN`: keep running and scan every MIN minutes.
 - `--setup`: enter, check and save your Alpaca keys and data feed.
 - `--diagnose`: test each data source and print which ones respond. Use it when a scan fails.
