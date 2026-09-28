@@ -8,6 +8,10 @@ Market and product research for Tempore: what to build next, for whom, and why. 
 |---|---|---|---|
 | Compliance bottlenecks | September 2026 | Which compliance frustrations practitioners voice online could Tempore turn into software? | [report](compliance-bottlenecks-2026-09/report.md) · [notes](compliance-bottlenecks-2026-09/notes/) · [Reddit validation](compliance-bottlenecks-2026-09/validation/2026-09-reddit/report.md) |
 
+## Tools
+
+- [Market move scanner](market-moves-scanner/): runs on your computer and uses Alpaca market data to check the most traded US stocks every 5 minutes for large moves, classifies each as news-driven or automated selling, and rates it Strong Buy / Buy / Hold.
+
 ## Conventions
 
 - `report.md` is the synthesis to read and share. `notes/` holds the per-topic research it was written from, with a source URL for every claim.
