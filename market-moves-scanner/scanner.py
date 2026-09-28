@@ -944,9 +944,18 @@ def _mac_notifier() -> str | None:
 
 
 def notify(title: str, body: str, subtitle: str = "",
-           open_path: str | None = None) -> None:
+           open_path: str | None = None) -> str:
     """Best-effort desktop notification on macOS, Linux or Windows.
-    With terminal-notifier on macOS, clicking it opens `open_path`."""
+    With terminal-notifier on macOS, clicking it opens `open_path`.
+    Returns a one-line description of how it was sent (for diagnosis)."""
+    def ran(name: str, p) -> str:
+        err = (p.stderr or b"").decode("utf-8", "replace").strip() \
+            if p is not None else ""
+        code = getattr(p, "returncode", 0)
+        if code:
+            print(f"warn: {name} failed (exit {code}): {err}",
+                  file=sys.stderr)
+        return f"{name} (exit {code})" + (f": {err}" if err else "")
     try:
         if sys.platform == "darwin":
             tn = _mac_notifier()
@@ -958,15 +967,17 @@ def notify(title: str, body: str, subtitle: str = "",
                 if open_path:
                     cmd += ["-open", "file://" + urllib.parse.quote(
                         os.path.abspath(open_path))]
-                subprocess.run(cmd, timeout=10, capture_output=True)
+                return ran(tn, subprocess.run(cmd, timeout=10,
+                                              capture_output=True))
             else:
                 script = (f"display notification {json.dumps(body)} "
                           f"with title {json.dumps(title)}"
                           + (f" subtitle {json.dumps(subtitle)}"
                              if subtitle else "")
                           + ' sound name "default"')
-                subprocess.run(["osascript", "-e", script], timeout=10,
-                               capture_output=True)
+                return ran("osascript", subprocess.run(
+                    ["osascript", "-e", script], timeout=10,
+                    capture_output=True))
         elif sys.platform.startswith("win"):
             text = f"{subtitle}\n{body}" if subtitle else body
             ps = (
@@ -978,6 +989,7 @@ def notify(title: str, body: str, subtitle: str = "",
                 "'Info');Start-Sleep 11;$n.Dispose()")
             subprocess.Popen(["powershell", "-NoProfile", "-Command", ps],
                              creationflags=0x08000000)  # no console window
+            return "powershell balloon"
         elif shutil.which("notify-send"):
             env = dict(os.environ)
             # cron has no desktop session variables; point at the user's bus.
@@ -985,10 +997,13 @@ def notify(title: str, body: str, subtitle: str = "",
             if "DBUS_SESSION_BUS_ADDRESS" not in env and os.path.exists(bus):
                 env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
             text = f"{subtitle}\n{body}" if subtitle else body
-            subprocess.run(["notify-send", "-a", "Market moves", title, text],
-                           timeout=10, env=env)
+            return ran("notify-send", subprocess.run(
+                ["notify-send", "-a", "Market moves", title, text],
+                timeout=10, env=env, capture_output=True))
+        return "no notification tool found (install notify-send)"
     except Exception as e:
         print(f"warn: notification failed: {e}", file=sys.stderr)
+        return f"failed: {e}"
 
 
 def ps_quote(s: str) -> str:
@@ -1189,12 +1204,12 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.test_notification:
-        notify("NVDA -4.9% → Buy", "No catalyst headlines found; steady, "
-               "evenly sized bars (execution-algo footprint)",
-               "Automated selling · $118.20 · score 64.5 (sample)",
-               os.path.join(REPORTS, "latest.md"))
-        print("Sent a sample notification. If none appeared, see "
-              "'Notifications' in README.md.")
+        how = notify("NVDA -4.9% → Buy", "No catalyst headlines found; "
+                     "steady, evenly sized bars (execution-algo footprint)",
+                     "Automated selling · $118.20 · score 64.5 (sample)",
+                     os.path.join(REPORTS, "latest.md"))
+        print(f"Sent a sample notification via {how}.")
+        print("If none appeared, see 'Notifications' in README.md.")
         return 0
 
     if args.setup:

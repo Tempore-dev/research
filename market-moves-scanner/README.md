@@ -52,7 +52,13 @@ If scheduled scans start failing (bad keys, no internet), you get one "scans fai
 
 **Check that notifications reach you:** `python3 scanner.py --test-notification` shows a sample.
 
-- **macOS:** notifications appear as coming from **Script Editor**. If the sample doesn't show up, open System Settings → Notifications → Script Editor and allow notifications. Choose the **Alerts** style so they stay on screen until you dismiss them. For notifications you can click to open `reports/latest.md`, install terminal-notifier (`brew install terminal-notifier`). The scanner uses it automatically when it's installed.
+- **macOS:** notifications appear as coming from **Script Editor**. If the sample doesn't show up:
+  1. Turn off Focus / Do Not Disturb (Control Center, top right of the menu bar).
+  2. macOS only lists Script Editor under Notifications after Script Editor has shown one itself. Open **Script Editor** (Applications → Utilities), paste `display notification "hello" with title "Test"`, and click ▶ Run. Click **Allow** if macOS asks.
+  3. In System Settings → Notifications → **Script Editor**, turn on *Allow notifications* and choose the **Alerts** style so they stay on screen until you dismiss them.
+  4. Run `python3 scanner.py --test-notification` again.
+
+  Or install terminal-notifier (`brew install terminal-notifier`): it asks for permission under its own name, and clicking its notifications opens `reports/latest.md`. The scanner uses it automatically when it's installed.
 - **Linux:** uses `notify-send` (package `libnotify-bin` on Debian/Ubuntu). It works from cron too.
 - **Windows:** shows a system-tray balloon.
 
