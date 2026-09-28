@@ -51,6 +51,8 @@ You don't need to watch the terminal. When a scan finds new or changed signals, 
 
 **Open details** opens `reports/latest.html` in your browser. It shows every current large move with its driver, evidence, headlines (linked) and factor scores, and marks the new ones. The alert closes by itself after 4 minutes if you don't click it.
 
+**On your phone:** the details page is laid out for phone screens (checked at iPhone SE, iPhone 15 Pro Max and Pixel 7 widths, light and dark mode). On a Mac with iCloud Drive turned on, every scan also saves it to **iCloud Drive → Market Moves → latest.html**. On an iPhone, open the Files app, go to that folder and tap the file. It updates with each scan, and headline links open in Safari. To save it somewhere else instead (Dropbox, Google Drive…), set `PHONE_DIR` to that folder; `PHONE_DIR=` turns the copy off.
+
 - **No repeats:** the same stock doesn't alert again that day unless its driver or rating changes, or the move grows by 2 more points.
 - **Quiet when nothing happens:** scans that find nothing stay silent.
 - **Failure alerts:** if scheduled scans start failing (bad keys, no internet), you get one "scans failing" alert per day, with an **Open log** button, until a scan succeeds.

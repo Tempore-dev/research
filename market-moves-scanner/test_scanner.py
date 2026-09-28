@@ -374,5 +374,36 @@ class HtmlReportTests(unittest.TestCase):
         self.assertIn("NVDA", s.sample_page())
 
 
+class PhoneCopyTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self._icloud = s.ICLOUD
+        self._env = s.os.environ.pop("PHONE_DIR", None)
+
+    def tearDown(self):
+        s.ICLOUD = self._icloud
+        s.os.environ.pop("PHONE_DIR", None)
+        if self._env is not None:
+            s.os.environ["PHONE_DIR"] = self._env
+
+    def test_copies_into_icloud_drive_when_present(self):
+        s.ICLOUD = self.tmp
+        s.copy_for_phone("<p>hi</p>")
+        with open(s.os.path.join(self.tmp, "Market Moves",
+                                 "latest.html")) as f:
+            self.assertEqual(f.read(), "<p>hi</p>")
+
+    def test_no_icloud_no_copy(self):
+        s.ICLOUD = s.os.path.join(self.tmp, "missing")
+        self.assertIsNone(s.phone_copy_dir())
+
+    def test_phone_dir_override_and_off(self):
+        s.os.environ["PHONE_DIR"] = self.tmp
+        self.assertEqual(s.phone_copy_dir(), self.tmp)
+        s.os.environ["PHONE_DIR"] = ""
+        self.assertIsNone(s.phone_copy_dir())
+
+
 if __name__ == "__main__":
     unittest.main()

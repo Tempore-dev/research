@@ -911,8 +911,10 @@ HTML_STYLE = """
   --text:#e8eaed; --muted:#9aa3ad; --line:#2a3038; --up:#3ccf7e;
   --down:#ff6b61; --accent:#7ea2ff; --badge:#252b33; } }
 * { box-sizing:border-box; }
+html { -webkit-text-size-adjust:100%; text-size-adjust:100%; }
 body { margin:0; background:var(--bg); color:var(--text);
-  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  overflow-wrap:anywhere; }
 main { max-width:860px; margin:0 auto; padding:24px 16px 48px; }
 h1 { font-size:22px; margin:0 0 4px; }
 .meta { color:var(--muted); margin:0 0 20px; }
@@ -1211,6 +1213,35 @@ def notify_error_once(message: str) -> None:
     save_json(path, state)
 
 
+ICLOUD = os.path.expanduser("~/Library/Mobile Documents/com~apple~CloudDocs")
+
+
+def phone_copy_dir() -> str | None:
+    """Folder the details page is copied to for viewing on a phone:
+    PHONE_DIR if set ("" turns it off), else iCloud Drive/Market Moves
+    when iCloud Drive is on (open it in the iPhone Files app)."""
+    d = os.environ.get("PHONE_DIR")
+    if d is not None:
+        return os.path.expanduser(d) or None
+    return os.path.join(ICLOUD, "Market Moves") if os.path.isdir(ICLOUD) \
+        else None
+
+
+def copy_for_phone(page: str) -> None:
+    d = phone_copy_dir()
+    if not d:
+        return
+    try:
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, ".latest.html.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(page)
+        os.replace(tmp, os.path.join(d, "latest.html"))  # no half files
+    except OSError as e:
+        print(f"warn: couldn't copy the details page to {d}: {e}",
+              file=sys.stderr)
+
+
 def run_once(force: bool, alert: bool) -> None:
     now = dt.datetime.now(dt.timezone.utc)
     if not force and not in_session_window(now):
@@ -1229,9 +1260,11 @@ def run_once(force: bool, alert: bool) -> None:
     today = str(now.astimezone(ET).date())
     fresh = new_signals(results, state, today)
     latest = os.path.join(REPORTS, "latest.html")
+    page = render_html(now, report.splitlines()[1], results,
+                       {x["move"].symbol for x in fresh})
     with open(latest, "w", encoding="utf-8") as f:
-        f.write(render_html(now, report.splitlines()[1], results,
-                            {x["move"].symbol for x in fresh}))
+        f.write(page)
+    copy_for_phone(page)
     state.pop("error_notified", None)  # a scan worked: re-arm error alerts
     with open(state_path, "w") as f:
         json.dump(state, f)
