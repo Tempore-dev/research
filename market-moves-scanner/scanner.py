@@ -1209,6 +1209,14 @@ def notify_error_once(message: str) -> None:
     else:
         notify("Market move scanner: scans failing", message[:200],
                "Run: python3 scanner.py --diagnose", log)
+    if ntfy_settings()["topic"]:
+        try:
+            ntfy_publish({"title": "Market move scanner: scans failing",
+                          "message": f"{message[:300]}\nOn the Mac, run: "
+                                     "python3 scanner.py --diagnose",
+                          "tags": ["warning"], "priority": 4})
+        except Exception as e:
+            print(f"warn: ntfy push failed: {e}", file=sys.stderr)
     state["error_notified"] = today
     save_json(path, state)
 
@@ -1240,6 +1248,123 @@ def copy_for_phone(page: str) -> None:
     except OSError as e:
         print(f"warn: couldn't copy the details page to {d}: {e}",
               file=sys.stderr)
+
+
+NTFY_CONFIG = os.path.join(os.path.dirname(CONFIG), "ntfy.json")
+MAX_PUSHES = 6  # per scan; the rest are summarised in one more
+
+
+def ntfy_settings() -> dict:
+    """{server, topic, token} from NTFY_* variables or --setup-ntfy's file.
+    An empty topic means phone pushes are off."""
+    cfg = load_state(NTFY_CONFIG)
+    return {"server": (os.environ.get("NTFY_SERVER") or cfg.get("server")
+                       or "https://ntfy.sh").rstrip("/"),
+            "topic": os.environ.get("NTFY_TOPIC", cfg.get("topic", "")),
+            "token": os.environ.get("NTFY_TOKEN", cfg.get("token", ""))}
+
+
+def ntfy_publish(msg: dict, cfg: dict | None = None) -> None:
+    """Publish one message with ntfy's JSON API (UTF-8 safe, unlike
+    header-based publishing). Raises FetchError on failure."""
+    cfg = cfg or ntfy_settings()
+    headers = {"Content-Type": "application/json"}
+    if cfg["token"]:
+        headers["Authorization"] = f"Bearer {cfg['token']}"
+    body = json.dumps({"topic": cfg["topic"], **msg}).encode()
+    req = urllib.request.Request(cfg["server"] + "/", data=body,
+                                 headers={"User-Agent": UA, **headers},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace") if e.fp else ""
+        raise FetchError(e.code, cfg["server"], detail) from None
+
+
+def ntfy_message(x: dict) -> dict:
+    """A phone notification for one signal: the headline facts in the
+    title, the reasoning and factor scores in the body, and a tap that
+    opens the catalyst article when there is one."""
+    m, v, r = x["move"], x["verdict"], x["rating"]
+    title, subtitle, _ = signal_notification(x)
+    lines = [subtitle]
+    if v.catalysts:
+        lines.append(f"📰 {v.catalysts[0]['title']}")
+    if v.reasons:
+        lines.append("Why: " + "; ".join(v.reasons[:3]))
+    lines.append("Factors: " + " · ".join(
+        f"{k} {'n/a' if f is None else f}" for k, f in r.factors.items()))
+    msg = {"title": title, "message": "\n".join(lines),
+           "tags": ["chart_with_upwards_trend" if m.move_pct >= 0
+                    else "chart_with_downwards_trend"],
+           "priority": 4 if r.rating == "Strong Buy" else 3}
+    link = v.catalysts[0].get("link") if v.catalysts else ""
+    if link:
+        msg["click"] = link
+        msg["actions"] = [{"action": "view", "label": "Open article",
+                           "url": link}]
+    return msg
+
+
+def push_signals(fresh: list[dict]) -> int:
+    """Send new signals to the phone via ntfy; returns messages sent.
+    Never raises: a failed push mustn't stop the desktop alert."""
+    cfg = ntfy_settings()
+    if not cfg["topic"] or not fresh:
+        return 0
+    msgs = [ntfy_message(x) for x in fresh[:MAX_PUSHES]]
+    rest = fresh[MAX_PUSHES:]
+    if rest:
+        msgs.append({"title": f"Market moves: {len(rest)} more signal(s)",
+                     "message": "\n".join(one_liner(x) for x in rest[:10]),
+                     "tags": ["chart_with_downwards_trend"]})
+    sent = 0
+    for msg in msgs:
+        try:
+            ntfy_publish(msg, cfg)
+            sent += 1
+        except Exception as e:
+            print(f"warn: ntfy push failed: {e}", file=sys.stderr)
+            break
+    return sent
+
+
+def setup_ntfy() -> None:
+    """Pick a private topic, save it, and send a test push."""
+    import secrets
+    cfg = ntfy_settings()
+    print("Phone notifications use ntfy (free). Install the ntfy app:\n"
+          "  iPhone: App Store → search 'ntfy'\n"
+          "  Android: Google Play or F-Droid → 'ntfy'\n")
+    print("Topics on ntfy.sh are public: anyone who knows the name can read "
+          "it,\nso use a long random one (the suggestion below).")
+    suggested = cfg["topic"] or f"market-moves-{secrets.token_urlsafe(12)}"
+    topic = input(f"Topic [{suggested}]: ").strip() or suggested
+    server = input(f"Server [{cfg['server']}]: ").strip() or cfg["server"]
+    token = input("Access token (only for a protected server; Enter to "
+                  "skip): ").strip() or cfg["token"]
+    new = {"server": server.rstrip("/"), "topic": topic, "token": token}
+    os.makedirs(os.path.dirname(NTFY_CONFIG), exist_ok=True)
+    fd = os.open(NTFY_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(new, f)
+    print(f"\nSaved to {NTFY_CONFIG}.")
+    print(f"\nIn the ntfy app, tap + (Subscribe to topic) and enter:\n"
+          f"  {topic}\n"
+          + ("" if new["server"] == "https://ntfy.sh" else
+             f"  (Use another server: {new['server']})\n"))
+    input("Press Enter once you've subscribed, to send a test push... ")
+    try:
+        ntfy_publish(ntfy_message(sample_result()) | {
+            "title": "Market move scanner connected",
+            "tags": ["white_check_mark"]}, new)
+        print("Sent. If it didn't arrive, check the topic name matches "
+              "exactly and that\nnotifications are allowed for ntfy in your "
+              "phone's settings.")
+    except Exception as e:
+        print(f"Couldn't send the test push: {e}")
 
 
 def run_once(force: bool, alert: bool) -> None:
@@ -1274,6 +1399,7 @@ def run_once(force: bool, alert: bool) -> None:
                            fresh) + "\n\n")
         if alert:
             notify_signals(fresh, latest)
+            push_signals(fresh)
 
 
 def setup() -> None:
@@ -1366,8 +1492,8 @@ def uninstall() -> None:
     print("Schedule removed.")
 
 
-def sample_page() -> str:
-    """Details page for --test-notification, built from made-up data."""
+def sample_result() -> dict:
+    """A made-up signal for --test-notification and --setup-ntfy."""
     import types
     m = types.SimpleNamespace(
         symbol="NVDA", name="NVIDIA Corp (sample)", move_pct=-4.9,
@@ -1379,9 +1505,14 @@ def sample_page() -> str:
     r = Rating("Buy", 64.5, {"catalyst": 80, "momentum": 65,
                              "valuation": None, "analyst": None,
                              "technical": 60, "risk": 65})
+    return {"move": m, "verdict": v, "rating": r}
+
+
+def sample_page() -> str:
+    """Details page for --test-notification, built from made-up data."""
     return render_html(dt.datetime.now(ET), "Sample data — this is what "
                        "the Open details button shows after a real scan.",
-                       [{"move": m, "verdict": v, "rating": r}], {"NVDA"})
+                       [sample_result()], {"NVDA"})
 
 
 def main() -> int:
@@ -1389,7 +1520,7 @@ def main() -> int:
     ap.add_argument("--force", action="store_true",
                     help="run even when the market is closed")
     ap.add_argument("--no-alert", action="store_true",
-                    help="skip desktop notifications")
+                    help="skip desktop and phone notifications")
     ap.add_argument("--every", type=float, metavar="MIN",
                     help="stay running and scan every MIN minutes")
     ap.add_argument("--install", action="store_true",
@@ -1401,8 +1532,14 @@ def main() -> int:
     ap.add_argument("--setup", action="store_true",
                     help="enter and save your Alpaca API keys")
     ap.add_argument("--test-notification", action="store_true",
-                    help="show a sample notification")
+                    help="show a sample notification (and phone push)")
+    ap.add_argument("--setup-ntfy", action="store_true",
+                    help="set up push notifications to your phone")
     args = ap.parse_args()
+
+    if args.setup_ntfy:
+        setup_ntfy()
+        return 0
 
     if args.test_notification:
         os.makedirs(REPORTS, exist_ok=True)
@@ -1415,7 +1552,13 @@ def main() -> int:
             "No catalyst headlines found; steady, evenly sized bars "
             "(execution-algo footprint)")], sample)
         print(f"Sent a sample notification via {how}.")
-        print("If none appeared, see 'Notifications' in README.md.")
+        if ntfy_settings()["topic"]:
+            n = push_signals([sample_result()])
+            print("Sent a sample push to your phone via ntfy." if n else
+                  "The phone push failed (see the warning above).")
+        else:
+            print("Phone pushes are off; set them up with --setup-ntfy.")
+        print("If nothing appeared, see 'Notifications' in README.md.")
         return 0
 
     if args.setup:

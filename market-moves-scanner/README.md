@@ -51,6 +51,24 @@ You don't need to watch the terminal. When a scan finds new or changed signals, 
 
 **Open details** opens `reports/latest.html` in your browser. It shows every current large move with its driver, evidence, headlines (linked) and factor scores, and marks the new ones. The alert closes by itself after 4 minutes if you don't click it.
 
+**Push notifications to your phone (ntfy):** run `python3 scanner.py --setup-ntfy` once. It:
+1. tells you to install the free **ntfy** app (App Store or Google Play),
+2. suggests a long random topic name (the private channel your alerts go to), which you subscribe to in the app,
+3. saves the settings to `~/.config/market-moves-scanner/ntfy.json` (readable only by you), and
+4. sends a test push.
+
+After that, every new signal is pushed to your phone as well:
+
+> **NVDA −4.9% → Buy**
+> Automated selling · $118.20 · score 64.5
+> 📰 top headline, if any
+> Why: no catalyst headlines found; steady, evenly sized bars…
+> Factors: catalyst 80 · momentum 65 · valuation n/a · …
+
+Tapping a news-driven alert opens the article. Strong Buy alerts are sent at high priority. A scan sends at most six pushes, and any further signals are summed up in one more. Failure alerts go to the phone too. `--test-notification` also sends a sample push.
+
+Anyone who knows a topic name on the public ntfy.sh server can read its messages, so keep the random name. Alerts contain market data only, nothing about you. For a private or self-hosted ntfy server, enter its URL and access token during `--setup-ntfy`. The `NTFY_SERVER`, `NTFY_TOPIC` and `NTFY_TOKEN` environment variables override the saved settings, and `NTFY_TOPIC=` turns pushes off.
+
 **On your phone:** the details page is laid out for phone screens (checked at iPhone SE, iPhone 15 Pro Max and Pixel 7 widths, light and dark mode). On a Mac with iCloud Drive turned on, every scan also saves it to **iCloud Drive → Market Moves → latest.html**. On an iPhone, open the Files app, go to that folder and tap the file. It updates with each scan, and headline links open in Safari. To save it somewhere else instead (Dropbox, Google Drive…), set `PHONE_DIR` to that folder; `PHONE_DIR=` turns the copy off.
 
 - **No repeats:** the same stock doesn't alert again that day unless its driver or rating changes, or the move grows by 2 more points.
@@ -63,7 +81,7 @@ You don't need to watch the terminal. When a scan finds new or changed signals, 
 - **Linux:** one `notify-send` banner per signal (package `libnotify-bin` on Debian/Ubuntu). It works from cron too.
 - **Windows:** one system-tray balloon per signal.
 
-`--no-alert` turns notifications off.
+`--no-alert` turns desktop and phone notifications off.
 
 ## News vs automated selling
 
@@ -111,7 +129,8 @@ A scan makes about 4 Alpaca requests. Daily bars are fetched once a day and cach
 
 - `--force`: run even when the market is closed (uses the last session's data).
 - `--no-alert`: skip desktop notifications.
-- `--test-notification`: show a sample alert.
+- `--test-notification`: show a sample alert (and a sample phone push, if set up).
+- `--setup-ntfy`: set up push notifications to your phone.
 - `--every MIN`: keep running and scan every MIN minutes.
 - `--setup`: enter, check and save your Alpaca keys and data feed.
 - `--diagnose`: test each data source and print which ones respond. Use it when a scan fails.

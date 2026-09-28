@@ -405,5 +405,94 @@ class PhoneCopyTests(unittest.TestCase):
         self.assertIsNone(s.phone_copy_dir())
 
 
+class NtfyTests(unittest.TestCase):
+    """Publishes to a real local HTTP server standing in for ntfy.sh."""
+
+    def setUp(self):
+        import http.server, threading
+        self.posts, self.status = [], 200
+        test = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                import json
+                n = int(self.headers["Content-Length"])
+                test.posts.append((self.path, dict(self.headers),
+                                   json.loads(self.rfile.read(n))))
+                self.send_response(test.status)
+                self.end_headers()
+                self.wfile.write(b'{"id":"x"}')
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self._env = {k: s.os.environ.get(k)
+                     for k in ("NTFY_SERVER", "NTFY_TOPIC", "NTFY_TOKEN")}
+        s.os.environ.update(NTFY_SERVER=f"http://127.0.0.1:"
+                                        f"{self.srv.server_port}/",
+                            NTFY_TOPIC="market-moves-test", NTFY_TOKEN="")
+
+    def tearDown(self):
+        self.srv.shutdown()
+        for k, v in self._env.items():
+            if v is None:
+                s.os.environ.pop(k, None)
+            else:
+                s.os.environ[k] = v
+
+    def test_signal_push_payload(self):
+        x = s.sample_result()
+        x["verdict"].catalysts = [{"title": "NVDA supplier warns",
+                                   "link": "https://news.example/a",
+                                   "ts": 0, "publisher": "Wire"}]
+        self.assertEqual(s.push_signals([x]), 1)
+        path, headers, body = self.posts[0]
+        self.assertEqual(path, "/")
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertNotIn("Authorization", headers)
+        self.assertEqual(body["topic"], "market-moves-test")
+        self.assertEqual(body["title"], "NVDA -4.9% → Buy")
+        self.assertIn("📰 NVDA supplier warns", body["message"])
+        self.assertIn("valuation n/a", body["message"])
+        self.assertEqual(body["tags"], ["chart_with_downwards_trend"])
+        self.assertEqual(body["click"], "https://news.example/a")
+        self.assertEqual(body["actions"][0]["action"], "view")
+
+    def test_token_sent_as_bearer(self):
+        s.os.environ["NTFY_TOKEN"] = "tk_abc"
+        s.push_signals([s.sample_result()])
+        self.assertEqual(self.posts[0][1]["Authorization"], "Bearer tk_abc")
+
+    def test_overflow_summarised(self):
+        self.assertEqual(s.push_signals([s.sample_result()] * 9),
+                         s.MAX_PUSHES + 1)
+        self.assertIn("3 more", self.posts[-1][2]["title"])
+
+    def test_failure_warns_but_does_not_raise(self):
+        self.status = 429
+        self.assertEqual(s.push_signals([s.sample_result()] * 3), 0)
+        self.assertEqual(len(self.posts), 1)  # stops after first failure
+
+    def test_off_without_topic(self):
+        s.os.environ["NTFY_TOPIC"] = ""
+        self.assertEqual(s.push_signals([s.sample_result()]), 0)
+        self.assertEqual(self.posts, [])
+
+    def test_error_alert_pushed(self):
+        import tempfile
+        reports, s.REPORTS = s.REPORTS, tempfile.mkdtemp()
+        notify, s.notify = s.notify, lambda *a: None
+        plat, s.sys.platform = s.sys.platform, "linux"
+        try:
+            s.notify_error_once("HTTP 401 Unauthorized")
+            s.notify_error_once("HTTP 401 Unauthorized")
+        finally:
+            s.REPORTS, s.notify, s.sys.platform = reports, notify, plat
+        self.assertEqual(len(self.posts), 1)
+        self.assertIn("scans failing", self.posts[0][2]["title"])
+
+
 if __name__ == "__main__":
     unittest.main()
