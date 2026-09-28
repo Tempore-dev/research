@@ -1,0 +1,51 @@
+name: Market move scanner
+
+# Every 5 minutes on weekdays. The window covers 9:30-16:00 ET in both EDT
+# and EST; the script exits immediately outside market hours and on holidays.
+# GitHub may delay scheduled runs by a few minutes when its runners are busy.
+on:
+  schedule:
+    - cron: "*/5 13-21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even if the market is closed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: market-moves
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    defaults:
+      run:
+        working-directory: market-moves-scanner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: market-moves-scanner
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Remembers which signals were already alerted today, so the issue only
+      # gets new or changed signals rather than a comment every 5 minutes.
+      - uses: actions/cache@v4
+        with:
+          path: market-moves-scanner/.scanner-state.json
+          key: scanner-state-${{ github.run_id }}
+          restore-keys: scanner-state-
+
+      - name: Scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scanner.py ${{ inputs.force && '--force' || '' }}
