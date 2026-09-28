@@ -4,8 +4,8 @@
 Runs on your own computer, every 5 minutes during US market hours
 (install the schedule with `python3 scanner.py --install`). Each run:
 
-1. Pull Yahoo Finance's "most actives" list (fallback: a fixed list of
-   habitually high-volume tickers).
+1. Pull the most traded stocks from Alpaca's market data API (fallback:
+   a fixed list of habitually high-volume tickers).
 2. Flag large moves: |change vs prior close| >= MOVE_PCT, or a move of
    >= MOVE_SIGMA daily standard deviations.
 3. For each flagged stock, decide whether the move is news-driven or
@@ -17,6 +17,10 @@ Runs on your own computer, every 5 minutes during US market hours
    analyst consensus, technicals and liquidity/risk.
 5. Write reports/latest.md (full snapshot), append new or changed signals
    to reports/<date>.md, and pop a desktop notification for them.
+
+Data: Alpaca (free account; keys via `--setup`) for the most-actives list,
+5-minute and daily bars and news; Google News for extra headlines; Yahoo
+Finance, best effort, for P/E, analyst rating and market cap.
 
 Standard library only. Not investment advice.
 """
@@ -128,177 +132,144 @@ POSITIVE = [
 
 # ---------------------------------------------------------------- data layer
 
+CONFIG = os.path.join(os.path.expanduser("~"), ".config",
+                      "market-moves-scanner", "alpaca.json")
+
+
 class FetchError(Exception):
-    def __init__(self, code: int, url: str) -> None:
-        super().__init__(f"HTTP {code} from {urllib.parse.urlsplit(url).netloc}")
+    def __init__(self, code: int, url: str, detail: str = "") -> None:
+        host = urllib.parse.urlsplit(url).netloc
+        super().__init__(f"HTTP {code} from {host}"
+                         + (f": {detail[:200]}" if detail else ""))
         self.code = code
 
 
-class Yahoo:
-    """Minimal Yahoo Finance client (cookie + crumb aware).
+def http_get(url: str, headers: dict | None = None, timeout: int = 20,
+             opener=None) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "Accept": "*/*",
+                                               **(headers or {})})
+    try:
+        fetch = opener.open if opener else urllib.request.urlopen
+        with fetch(req, timeout=timeout) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace") if e.fp else ""
+        raise FetchError(e.code, url, detail) from None
 
-    Yahoo often answers plain Python HTTP clients with 429 Too Many Requests
-    regardless of volume, so requests go through the first transport that
-    works: curl_cffi (if installed; impersonates Chrome), then urllib, then
-    the system curl binary. Requests are spaced out and retried on 429."""
 
-    GAP_S = 0.35   # minimum spacing between requests
+def parse_ts(s: str) -> int:
+    """RFC 3339 (Alpaca's format, sometimes with nanoseconds) -> epoch s."""
+    s = re.sub(r"\.\d+", "", s).replace("Z", "+00:00")
+    return int(dt.datetime.fromisoformat(s).timestamp())
 
-    def __init__(self) -> None:
-        self.jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.jar))
-        self.crumb: str | None = None
-        self.transport = "urllib"
-        self.cffi = None
-        try:
-            from curl_cffi import requests as cffi_requests
-            self.cffi = cffi_requests.Session(impersonate="chrome")
-            self.transport = "curl_cffi"
-        except Exception:
-            pass
-        self.curl_jar = os.path.join(CACHE, "cookies.txt")
-        self._last = 0.0
 
-    def _fetch(self, url: str, timeout: int) -> bytes:
-        wait = self.GAP_S - (time.time() - self._last)
-        if wait > 0:
-            time.sleep(wait)
-        self._last = time.time()
-        if self.transport == "curl_cffi":
-            r = self.cffi.get(url, timeout=timeout)
-            if r.status_code >= 400:
-                raise FetchError(r.status_code, url)
-            return r.content
-        if self.transport == "curl":
-            os.makedirs(CACHE, exist_ok=True)
-            p = subprocess.run(
-                ["curl", "-sS", "-L", "--compressed", "-m", str(timeout),
-                 "-A", UA, "-H", "Accept: */*", "-b", self.curl_jar,
-                 "-c", self.curl_jar, "-w", "\n%{http_code}", url],
-                capture_output=True, timeout=timeout + 5)
-            body, _, code = p.stdout.rpartition(b"\n")
-            status = int(code or 0)
-            if p.returncode or status >= 400 or status == 0:
-                raise FetchError(status, url)
-            return body
-        req = urllib.request.Request(url, headers={"User-Agent": UA,
-                                                   "Accept": "*/*"})
-        try:
-            with self.opener.open(req, timeout=timeout) as r:
-                return r.read()
-        except urllib.error.HTTPError as e:
-            raise FetchError(e.code, url) from None
+def load_keys() -> tuple[str, str, str]:
+    """Alpaca key id, secret and data feed, from the environment or the
+    config file written by --setup (schedulers don't see shell variables)."""
+    cfg: dict = {}
+    try:
+        with open(CONFIG) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        pass
+    key = (os.environ.get("ALPACA_API_KEY_ID")
+           or os.environ.get("APCA_API_KEY_ID") or cfg.get("key_id", ""))
+    secret = (os.environ.get("ALPACA_API_SECRET_KEY")
+              or os.environ.get("APCA_API_SECRET_KEY")
+              or cfg.get("secret_key", ""))
+    feed = os.environ.get("ALPACA_FEED") or cfg.get("feed", "iex")
+    return key, secret, feed
 
-    def _get(self, url: str, timeout: int = 15) -> bytes:
-        for attempt in range(4):
+
+class Alpaca:
+    """Alpaca market data API (https://data.alpaca.markets).
+
+    The free plan gives real-time bars from the IEX exchange (feed "iex"),
+    which carries a few percent of US volume; relative-volume figures stay
+    consistent because every bar comes from the same feed. "delayed_sip"
+    (free, 15 min delay) or "sip" (paid) use the full consolidated tape."""
+
+    BASE = "https://data.alpaca.markets"
+
+    def __init__(self, key: str, secret: str, feed: str = "iex") -> None:
+        if not key or not secret:
+            raise SystemExit(
+                "No Alpaca API keys found. Run: python3 scanner.py --setup")
+        self.headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+        self.feed = feed
+
+    @classmethod
+    def from_config(cls) -> "Alpaca":
+        return cls(*load_keys())
+
+    def _get(self, path: str, params: dict) -> dict:
+        q = urllib.parse.urlencode({k: v for k, v in params.items()
+                                    if v is not None})
+        url = f"{self.BASE}{path}?{q}"
+        for attempt in range(3):
             try:
-                return self._fetch(url, timeout)
+                return json.loads(http_get(url, self.headers))
             except FetchError as e:
-                if e.code not in (429, 403, 999) or attempt == 3:
+                if e.code != 429 or attempt == 2:
                     raise
-                # Blocked: fall back to the system curl binary once, then
-                # back off and alternate Yahoo's two API hosts.
-                if self.transport == "urllib" and shutil.which("curl"):
-                    self.transport = "curl"
-                    url = self._reauth(url, timeout)
-                    continue
-                time.sleep(2 * (attempt + 1))
-                url = (url.replace("//query1.", "//query2.")
-                       if "//query1." in url
-                       else url.replace("//query2.", "//query1."))
+                time.sleep(3 * (attempt + 1))  # free plan: 200 requests/min
         raise AssertionError("unreachable")
 
-    def _reauth(self, url: str, timeout: int) -> str:
-        """After switching transport, cookies and crumb must be re-issued."""
-        if "getcrumb" in url:
-            try:
-                self._fetch("https://fc.yahoo.com", timeout)
-            except FetchError:
-                pass  # 404 is expected; it still sets the cookie
-            return url
-        if "crumb=" in url:
-            self.crumb = None
-            url = re.sub(r"[&?]crumb=[^&]*", "", url)
-            self._ensure_crumb()
-            if self.crumb:
-                sep = "&" if "?" in url else "?"
-                url += f"{sep}crumb={urllib.parse.quote(self.crumb)}"
-        else:
-            self.crumb = None
-        return url
+    def most_active(self, n: int) -> list[str]:
+        data = self._get("/v1beta1/screener/stocks/most-actives",
+                         {"by": "volume", "top": n})
+        return [x["symbol"] for x in data.get("most_actives", [])]
 
-    def _json(self, url: str, crumb: bool = False) -> dict:
-        if crumb:
-            self._ensure_crumb()
-            if self.crumb:
-                sep = "&" if "?" in url else "?"
-                url += f"{sep}crumb={urllib.parse.quote(self.crumb)}"
-        return json.loads(self._get(url))
+    def bars(self, symbols: list[str], timeframe: str, start: dt.datetime,
+             end: dt.datetime | None = None,
+             adjustment: str = "raw") -> dict[str, list[dict]]:
+        out: dict[str, list[dict]] = {}
+        params = {"symbols": ",".join(symbols), "timeframe": timeframe,
+                  "start": start.astimezone(dt.timezone.utc).strftime(
+                      "%Y-%m-%dT%H:%M:%SZ"),
+                  "end": end.astimezone(dt.timezone.utc).strftime(
+                      "%Y-%m-%dT%H:%M:%SZ") if end else None,
+                  "limit": 10000, "adjustment": adjustment,
+                  "feed": self.feed, "sort": "asc"}
+        while True:
+            data = self._get("/v2/stocks/bars", params)
+            for sym, rows in (data.get("bars") or {}).items():
+                out.setdefault(sym, []).extend(rows)
+            params["page_token"] = data.get("next_page_token")
+            if not params["page_token"]:
+                return out
 
-    def _ensure_crumb(self) -> None:
-        if self.crumb is not None:
-            return
-        self.crumb = ""
-        try:
-            try:
-                self._get("https://fc.yahoo.com")
-            except Exception:
-                pass  # 404 is expected; it still sets the cookie
-            self.crumb = self._get(
-                "https://query1.finance.yahoo.com/v1/test/getcrumb").decode()
-        except Exception:
-            self.crumb = ""
-
-    def most_active(self, n: int) -> list[dict]:
-        url = ("https://query1.finance.yahoo.com/v1/finance/screener/"
-               f"predefined/saved?scrIds=most_actives&count={n}")
-        data = self._json(url, crumb=True)
-        return data["finance"]["result"][0]["quotes"]
-
-    def quotes(self, symbols: list[str]) -> list[dict]:
-        url = ("https://query1.finance.yahoo.com/v7/finance/quote?symbols="
-               + urllib.parse.quote(",".join(symbols)))
-        return self._json(url, crumb=True)["quoteResponse"]["result"]
-
-    def chart(self, symbol: str, rng: str, interval: str) -> dict:
-        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/"
-               f"{urllib.parse.quote(symbol)}?range={rng}&interval={interval}"
-               "&includePrePost=false")
-        return self._json(url)["chart"]["result"][0]
-
-    def news(self, symbol: str) -> list[dict]:
-        """Headlines as {title, publisher, ts (epoch s), link}."""
-        out: list[dict] = []
-        try:
-            url = ("https://query1.finance.yahoo.com/v1/finance/search?q="
-                   f"{urllib.parse.quote(symbol)}&quotesCount=0&newsCount=15")
-            for n in self._json(url).get("news", []):
-                out.append({"title": n.get("title", ""),
-                            "publisher": n.get("publisher", ""),
-                            "ts": n.get("providerPublishTime", 0),
-                            "link": n.get("link", "")})
-        except Exception:
-            pass
-        try:
-            out.extend(google_news(self, symbol))
-        except Exception:
-            pass
-        seen, uniq = set(), []
-        for n in sorted(out, key=lambda n: -n["ts"]):
-            key = re.sub(r"\W+", "", n["title"].lower())[:60]
-            if key and key not in seen:
-                seen.add(key)
-                uniq.append(n)
-        return uniq
+    def news(self, symbols: list[str], since: dt.datetime,
+             pages: int = 4) -> dict[str, list[dict]]:
+        """Headlines per symbol as {title, publisher, ts, link}."""
+        out: dict[str, list[dict]] = {s: [] for s in symbols}
+        params = {"symbols": ",".join(symbols), "limit": 50, "sort": "desc",
+                  "start": since.astimezone(dt.timezone.utc).strftime(
+                      "%Y-%m-%dT%H:%M:%SZ")}
+        for _ in range(pages):
+            data = self._get("/v1beta1/news", params)
+            for n in data.get("news", []):
+                h = {"title": n.get("headline", ""),
+                     "publisher": n.get("source", ""),
+                     "ts": parse_ts(n["created_at"]),
+                     "link": n.get("url") or ""}
+                for sym in n.get("symbols", []):
+                    if sym in out:
+                        out[sym].append(h)
+            params["page_token"] = data.get("next_page_token")
+            if not params["page_token"]:
+                break
+        return out
 
 
-def google_news(y: Yahoo, symbol: str) -> list[dict]:
+def google_news(symbol: str) -> list[dict]:
+    """Supplementary headlines from Google News RSS (best effort)."""
     import email.utils
     import xml.etree.ElementTree as ET_xml
     q = urllib.parse.quote(f"{symbol} stock when:1d")
-    raw = y._get(f"https://news.google.com/rss/search?q={q}"
-                 "&hl=en-US&gl=US&ceid=US:en")
+    raw = http_get(f"https://news.google.com/rss/search?q={q}"
+                   "&hl=en-US&gl=US&ceid=US:en", timeout=10)
     out = []
     for item in ET_xml.fromstring(raw).iter("item"):
         pub = item.findtext("pubDate") or ""
@@ -313,6 +284,81 @@ def google_news(y: Yahoo, symbol: str) -> list[dict]:
     return out
 
 
+def merge_headlines(*lists: list[dict]) -> list[dict]:
+    seen, uniq = set(), []
+    for n in sorted((h for lst in lists for h in lst), key=lambda n: -n["ts"]):
+        key = re.sub(r"\W+", "", n["title"].lower())[:60]
+        if key and key not in seen:
+            seen.add(key)
+            uniq.append(n)
+    return uniq
+
+
+def yahoo_fundamentals(symbols: list[str], now: dt.datetime,
+                       use_cache: bool = True) -> dict:
+    """P/E, analyst rating, market cap and name from Yahoo, fetched at most
+    once a day and only attempted every 30 min after a failure. Alpaca has
+    no fundamentals; without these the rating uses the other factors."""
+    if os.environ.get("YAHOO_FUNDAMENTALS", "1") == "0":
+        return {}
+    path = os.path.join(CACHE, f"fundamentals-{now.astimezone(ET):%Y%m%d}"
+                               ".json")
+    cache: dict = load_state(path) if use_cache else {}
+    missing = [s for s in symbols if s not in cache.get("quotes", {})]
+    if not missing or now.timestamp() - cache.get("failed_at", 0) < 1800:
+        return cache.get("quotes", {})
+    try:
+        try:
+            from curl_cffi import requests as cffi  # looks like Chrome
+            sess = cffi.Session(impersonate="chrome")
+
+            def get(url: str) -> bytes:
+                r = sess.get(url, timeout=15)
+                if r.status_code >= 400:
+                    raise FetchError(r.status_code, url)
+                return r.content
+        except ImportError:
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(
+                    http.cookiejar.CookieJar()))
+
+            def get(url: str) -> bytes:
+                return http_get(url, timeout=15, opener=opener)
+        try:
+            get("https://fc.yahoo.com")
+        except Exception:
+            pass  # 404 is expected; it still sets the cookie
+        crumb = get("https://query1.finance.yahoo.com/v1/test/getcrumb")
+        url = ("https://query1.finance.yahoo.com/v7/finance/quote?symbols="
+               + urllib.parse.quote(",".join(missing)) + "&crumb="
+               + urllib.parse.quote(crumb.decode()))
+        for q in json.loads(get(url))["quoteResponse"]["result"]:
+            cache.setdefault("quotes", {})[q["symbol"]] = q
+        cache.pop("failed_at", None)
+    except Exception as e:
+        print(f"note: Yahoo fundamentals unavailable ({e}); rating without "
+              "valuation/analyst factors", file=sys.stderr)
+        cache["failed_at"] = now.timestamp()
+    if use_cache:
+        save_json(path, cache, prefix="fundamentals-")
+    return cache.get("quotes", {})
+
+
+def save_json(path: str, data: dict, prefix: str = "") -> None:
+    """Write a cache file, removing older files with the same prefix."""
+    try:
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        if prefix:
+            for old in os.listdir(d):
+                if old.startswith(prefix) and old != os.path.basename(path):
+                    os.remove(os.path.join(d, old))
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
 @dataclass
 class Bars:
     ts: list[int]
@@ -323,13 +369,23 @@ class Bars:
     volume: list[float]
 
     @classmethod
-    def from_chart(cls, c: dict) -> "Bars":
-        q = c["indicators"]["quote"][0]
-        rows = [r for r in zip(c.get("timestamp", []), q["open"], q["high"],
-                               q["low"], q["close"], q["volume"])
-                if None not in r]
-        cols = list(zip(*rows)) if rows else [[]] * 6
-        return cls(*[list(x) for x in cols])
+    def from_alpaca(cls, rows: list[dict]) -> "Bars":
+        return cls([parse_ts(r["t"]) for r in rows],
+                   [r["o"] for r in rows], [r["h"] for r in rows],
+                   [r["l"] for r in rows], [r["c"] for r in rows],
+                   [r["v"] for r in rows])
+
+    def since(self, t0: float) -> "Bars":
+        i = next((i for i, t in enumerate(self.ts) if t >= t0), len(self.ts))
+        return Bars(*(col[i:] for col in self.cols()))
+
+    def before(self, t0: float) -> "Bars":
+        i = next((i for i, t in enumerate(self.ts) if t >= t0), len(self.ts))
+        return Bars(*(col[:i] for col in self.cols()))
+
+    def cols(self) -> tuple:
+        return (self.ts, self.open, self.high, self.low, self.close,
+                self.volume)
 
 
 # ------------------------------------------------------------ move analysis
@@ -559,7 +615,7 @@ def classify(m: Move, now: dt.datetime) -> Verdict:
 class Rating:
     rating: str
     score: float
-    factors: dict[str, float]
+    factors: dict[str, float | None]
 
 
 def rsi(closes: list[float], n: int = 14) -> float:
@@ -615,8 +671,9 @@ def rate(m: Move, v: Verdict, q: dict, daily: Bars) -> Rating:
 
     # 3. Valuation: forward P/E level plus implied earnings growth (PEG).
     fpe, tpe = q.get("forwardPE"), q.get("trailingPE")
+    valuation: float | None
     if fpe is None and tpe is None:
-        valuation = 50.0
+        valuation = None  # no data: factor dropped, weights rescaled
     elif fpe is not None and fpe <= 0:
         valuation = 25.0
     else:
@@ -629,10 +686,10 @@ def rate(m: Move, v: Verdict, q: dict, daily: Bars) -> Rating:
                 valuation += 10
             elif g < 0:
                 valuation -= 10
-    valuation = clamp(valuation)
+        valuation = clamp(valuation)
 
     # 4. Street consensus, e.g. "1.8 - Buy" (1 = strong buy, 5 = sell).
-    analyst = 50.0
+    analyst: float | None = None
     try:
         a = float(str(q.get("averageAnalystRating", "")).split("-")[0])
         analyst = clamp((5 - a) / 4 * 100)
@@ -647,10 +704,11 @@ def rate(m: Move, v: Verdict, q: dict, daily: Bars) -> Rating:
         tech += 10
     technical = clamp(tech)
 
-    # 6. Liquidity / risk.
-    cap = q.get("marketCap") or 0
-    risk = 80 if cap >= 2e11 else 65 if cap >= 1e10 else 50 if cap >= 2e9 \
-        else 30
+    # 6. Liquidity / risk: size tier (neutral 65 when unknown) less a
+    #    volatility penalty.
+    cap = q.get("marketCap")
+    risk = (65 if cap is None else 80 if cap >= 2e11 else 65 if cap >= 1e10
+            else 50 if cap >= 2e9 else 30)
     ann_vol = daily_sigma_pct(daily, 60) * math.sqrt(252)
     risk -= 20 if ann_vol > 80 else 10 if ann_vol > 50 else 0
     risk = clamp(risk)
@@ -659,7 +717,8 @@ def rate(m: Move, v: Verdict, q: dict, daily: Bars) -> Rating:
          "analyst": analyst, "technical": technical, "risk": risk}
     w = {"catalyst": .25, "momentum": .20, "valuation": .20,
          "analyst": .15, "technical": .10, "risk": .10}
-    score = sum(f[k] * w[k] for k in f)
+    have = [k for k in f if f[k] is not None]
+    score = sum(f[k] * w[k] for k in have) / sum(w[k] for k in have)
     bad_news = v.label == "News-driven" and down and v.news_tone == "negative"
     if score >= 68 and catalyst >= 60 and not bad_news:
         label = "Strong Buy"
@@ -667,7 +726,8 @@ def rate(m: Move, v: Verdict, q: dict, daily: Bars) -> Rating:
         label = "Buy"
     else:
         label = "Hold"
-    return Rating(label, round(score, 1), {k: round(x) for k, x in f.items()})
+    return Rating(label, round(score, 1),
+                  {k: None if x is None else round(x) for k, x in f.items()})
 
 
 # ------------------------------------------------------------------- runner
@@ -678,59 +738,64 @@ def in_session_window(now: dt.datetime) -> bool:
             and dt.time(9, 35) <= et.time() <= dt.time(16, 5))
 
 
-def cached_daily(y: Yahoo, sym: str, now: dt.datetime) -> dict:
-    """1y of daily bars, fetched once per symbol per day (they only change
-    at the close), which cuts each scan's requests by a third."""
-    path = os.path.join(CACHE, f"daily-{sym}-{now.astimezone(ET):%Y%m%d}"
-                               ".json")
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        pass
-    c = y.chart(sym, "1y", "1d")
-    try:
-        os.makedirs(CACHE, exist_ok=True)
-        for old in os.listdir(CACHE):
-            if old.startswith(f"daily-{sym}-"):
-                os.remove(os.path.join(CACHE, old))
-        with open(path, "w") as f:
-            json.dump(c, f)
-    except OSError:
-        pass
-    return c
+def cached_daily(api: Alpaca, symbols: list[str], session_open: dt.datetime,
+                 now: dt.datetime) -> dict[str, Bars]:
+    """A year of daily bars before the session, fetched once a day for each
+    symbol (they only change at the close)."""
+    path = os.path.join(CACHE, f"daily-{session_open:%Y%m%d}-{api.feed}.json")
+    cache = load_state(path)
+    missing = [s for s in symbols if s not in cache]
+    if missing:
+        cache.update({s: [] for s in missing})
+        cache.update(api.bars(missing, "1Day",
+                              session_open - dt.timedelta(days=400),
+                              session_open, adjustment="split"))
+        save_json(path, cache, prefix="daily-")
+    return {s: Bars.from_alpaca(cache.get(s, [])).before(
+        session_open.timestamp()) for s in symbols}
+
+
+def last_session(api: Alpaca, now: dt.datetime) -> tuple[dt.datetime, Bars]:
+    """Open time of the latest session with SPY trades, and SPY's 5m bars."""
+    spy = Bars.from_alpaca(api.bars(["SPY"], "5Min",
+                                    now - dt.timedelta(days=6),
+                                    now).get("SPY", []))
+    if not spy.ts:
+        raise RuntimeError("no SPY bars returned; check the Alpaca feed")
+    day = dt.datetime.fromtimestamp(spy.ts[-1], ET).date()
+    session_open = dt.datetime.combine(day, dt.time(9, 30), ET)
+    return session_open, spy.since(session_open.timestamp())
 
 
 def diagnose() -> None:
-    """Check each data source and transport; prints one line per check."""
-    y = Yahoo()
-    checks = [
-        ("price chart", "https://query1.finance.yahoo.com/v8/finance/chart/"
-                        "SPY?range=1d&interval=5m"),
-        ("cookie", "https://fc.yahoo.com"),
-        ("crumb", "https://query1.finance.yahoo.com/v1/test/getcrumb"),
-        ("news", "https://query1.finance.yahoo.com/v1/finance/search?q=AAPL"
-                 "&quotesCount=0&newsCount=3"),
-        ("google news", "https://news.google.com/rss/search?q=AAPL"),
-    ]
-    transports = (["curl_cffi"] if y.cffi else []) + ["urllib"] + (
-        ["curl"] if shutil.which("curl") else [])
-    for t in transports:
-        y.transport = t
-        for name, url in checks:
+    """Check each data source; prints one line per check."""
+    now = dt.datetime.now(dt.timezone.utc)
+    key, secret, feed = load_keys()
+    print(f"Alpaca keys: {'found' if key and secret else 'MISSING'} "
+          f"(feed: {feed}, config: {CONFIG})")
+    if key and secret:
+        api = Alpaca(key, secret, feed)
+        checks = [
+            ("most actives", lambda: f"{len(api.most_active(5))} symbols"),
+            ("5-min bars", lambda: f"{len(last_session(api, now)[1].ts)} "
+                                   "SPY bars in latest session"),
+            ("news", lambda: f"{len(api.news(['AAPL'], now - dt.timedelta(days=2), 1)['AAPL'])} AAPL headlines"),
+        ]
+        for name, fn in checks:
             try:
-                n = len(y._fetch(url, 15))
-                print(f"{t:9} {name:12} OK ({n} bytes)")
-            except FetchError as e:
-                print(f"{t:9} {name:12} {e}")
+                print(f"  {name:14} OK: {fn()}")
             except Exception as e:
-                print(f"{t:9} {name:12} error: {e}")
-    try:
-        y.transport = transports[0]
-        y.crumb = None
-        print(f"most actives: {len(y.most_active(5))} rows")
-    except Exception as e:
-        print(f"most actives: failed ({e})")
+                print(f"  {name:14} FAILED: {e}")
+    for name, fn in [
+        ("google news", lambda: f"{len(google_news('AAPL'))} headlines"),
+        ("yahoo P/E etc.", lambda: "OK" if yahoo_fundamentals(
+            ["AAPL"], now, use_cache=False) else
+            "unavailable (optional; ratings skip valuation/analyst)"),
+    ]:
+        try:
+            print(f"  {name:14} {fn()}")
+        except Exception as e:
+            print(f"  {name:14} FAILED: {e}")
 
 
 def market_open(now: dt.datetime, spy: Bars) -> bool:
@@ -740,61 +805,71 @@ def market_open(now: dt.datetime, spy: Bars) -> bool:
     return bool(spy.ts) and now.timestamp() - spy.ts[-1] < 20 * 60
 
 
-def scan(now: dt.datetime, force: bool = False) -> tuple[str, list[dict]]:
-    y = Yahoo()
-    spy = Bars.from_chart(y.chart("SPY", "1d", "5m"))
+def scan(now: dt.datetime, force: bool = False,
+         api: Alpaca | None = None) -> tuple[str, list[dict]]:
+    api = api or Alpaca.from_config()
+    session_open, spy = last_session(api, now)
     if not force and not market_open(now, spy):
         return "", []
+    # Analyse "as of" the latest bar, so --force on a weekend replays the
+    # last session instead of treating it as live.
+    as_of = min(now, session_open + dt.timedelta(hours=6, minutes=30))
 
     try:
-        universe = y.most_active(TOP_N)
-        source = "Yahoo most actives"
-    except Exception:
+        universe = [s for s in api.most_active(TOP_N + 5) if s != "SPY"]
+        universe = universe[:TOP_N]
+        source = "Alpaca most actives"
+    except Exception as e:
+        print(f"warn: most actives unavailable ({e})", file=sys.stderr)
         universe = []
     if not universe:
-        try:
-            universe = y.quotes(FALLBACK_TICKERS[:TOP_N])
-        except Exception:
-            universe = [{"symbol": s} for s in FALLBACK_TICKERS[:TOP_N]]
-        source = "fallback ticker list"
+        universe, source = FALLBACK_TICKERS[:TOP_N], "fallback ticker list"
 
-    results: list[dict] = []
-    for q in universe:
-        sym = q["symbol"]
+    intraday = {s: Bars.from_alpaca(rows).since(session_open.timestamp())
+                for s, rows in api.bars(universe, "5Min", session_open,
+                                        as_of).items()}
+    daily = cached_daily(api, universe, session_open, now)
+    quotes = yahoo_fundamentals(universe, now)
+
+    flagged: list[tuple[Move, Bars, dict]] = []
+    for sym in universe:
         try:
-            ic = y.chart(sym, "1d", "5m")
-            intraday = Bars.from_chart(ic)
-            daily = Bars.from_chart(cached_daily(y, sym, now))
-            # Drop today's (partial) daily bar so it doesn't skew stats.
-            if daily.ts and dt.datetime.fromtimestamp(
-                    daily.ts[-1], ET).date() == now.astimezone(ET).date():
-                daily = Bars(*[col[:-1] for col in (
-                    daily.ts, daily.open, daily.high, daily.low,
-                    daily.close, daily.volume)])
-            prev = (q.get("regularMarketPreviousClose")
-                    or ic["meta"].get("chartPreviousClose")
-                    or (daily.close[-1] if daily.close else 0))
-            avg_vol = (q.get("averageDailyVolume3Month")
-                       or (statistics.fmean(daily.volume[-60:])
-                           if daily.volume else 0))
-            m = analyse_move(sym, q.get("shortName", sym), intraday, daily,
-                             spy, prev, avg_vol, now)
-            if not m or not (abs(m.move_pct) >= MOVE_PCT
-                             or m.move_sigma >= MOVE_SIGMA):
+            d, q = daily.get(sym), quotes.get(sym, {})
+            if not d or not d.close or sym not in intraday:
                 continue
-            m.headlines = y.news(sym)
-            v = classify(m, now)
-            r = rate(m, v, q, daily)
-            results.append({"move": m, "verdict": v, "rating": r})
+            avg_vol = statistics.fmean(d.volume[-60:])
+            m = analyse_move(sym, q.get("shortName") or sym, intraday[sym],
+                             d, spy, d.close[-1], avg_vol, as_of)
+            if m and (abs(m.move_pct) >= MOVE_PCT
+                      or m.move_sigma >= MOVE_SIGMA):
+                flagged.append((m, d, q))
         except Exception as e:  # one bad ticker shouldn't kill the run
             print(f"warn: {sym}: {e}", file=sys.stderr)
 
+    news: dict[str, list[dict]] = {}
+    if flagged:
+        syms = [m.symbol for m, _, _ in flagged]
+        try:
+            news = api.news(syms, as_of - dt.timedelta(hours=NEWS_LOOKBACK_H))
+        except Exception as e:
+            print(f"warn: Alpaca news unavailable ({e})", file=sys.stderr)
+
+    results: list[dict] = []
+    for m, d, q in flagged:
+        try:
+            extra = google_news(m.symbol)
+        except Exception:
+            extra = []
+        m.headlines = merge_headlines(news.get(m.symbol, []), extra)
+        v = classify(m, as_of)
+        results.append({"move": m, "verdict": v, "rating": rate(m, v, q, d)})
+
     results.sort(key=lambda x: -abs(x["move"].move_pct))
     spy_move = pct(spy.close[-1], spy.open[0]) if spy.close else 0.0
-    header = (f"Universe: top {len(universe)} by volume ({source}). "
-              f"SPY {spy_move:+.2f}% today. Threshold: ≥{MOVE_PCT:g}% "
-              f"or ≥{MOVE_SIGMA:g}σ.")
-    return render(now, header, results), results
+    header = (f"Universe: top {len(universe)} by volume ({source}; "
+              f"{api.feed} feed). SPY {spy_move:+.2f}% today. Threshold: "
+              f"≥{MOVE_PCT:g}% or ≥{MOVE_SIGMA:g}σ.")
+    return render(as_of, header, results), results
 
 
 def render(now: dt.datetime, header: str, results: list[dict]) -> str:
@@ -818,7 +893,8 @@ def render(now: dt.datetime, header: str, results: list[dict]) -> str:
                 f"headline tone: {v.news_tone}) → **{r.rating}** ({r.score})",
                 "- Evidence: " + ("; ".join(v.reasons) or "—"),
                 "- Factors (0-100): " + ", ".join(
-                    f"{k} {s}" for k, s in r.factors.items())]
+                    f"{k} {'n/a' if s is None else s}"
+                    for k, s in r.factors.items())]
         for h in v.catalysts:
             t = dt.datetime.fromtimestamp(h["ts"], ET)
             out.append(f"- {t:%m-%d %H:%M} [{h['title']}]({h['link']}) "
@@ -919,6 +995,28 @@ def run_once(force: bool, alert: bool) -> None:
                    "\n".join(one_liner(x) for x in fresh[:5]))
 
 
+def setup() -> None:
+    """Ask for Alpaca keys, check them, and save them for scheduled runs."""
+    import getpass
+    print("Alpaca keys: sign up free at https://alpaca.markets, then in the "
+          "dashboard open API Keys and generate a key pair.")
+    key = input("API key ID: ").strip()
+    secret = getpass.getpass("Secret key (hidden as you type): ").strip()
+    feed = input("Data feed [iex]: ").strip() or "iex"
+    try:
+        n = len(Alpaca(key, secret, feed).most_active(5))
+        print(f"Keys work: got {n} most-active symbols.")
+    except Exception as e:
+        print(f"Those keys didn't work: {e}")
+        if input("Save anyway? [y/N] ").strip().lower() != "y":
+            return
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"key_id": key, "secret_key": secret, "feed": feed}, f)
+    print(f"Saved to {CONFIG} (readable only by you).")
+
+
 # --------------------------------------------------------------- scheduling
 
 TASK = "com.tempore.market-moves"
@@ -927,6 +1025,9 @@ CRON_TAG = "# market-moves-scanner"
 
 
 def install() -> None:
+    if not all(load_keys()[:2]):
+        print("Note: no Alpaca keys saved yet; scheduled runs will fail "
+              "until you run: python3 scanner.py --setup")
     py, script = sys.executable, os.path.abspath(__file__)
     log = os.path.join(REPORTS, "scanner.log")
     os.makedirs(REPORTS, exist_ok=True)
@@ -997,7 +1098,13 @@ def main() -> int:
                     help="remove the schedule")
     ap.add_argument("--diagnose", action="store_true",
                     help="test the data sources and print what works")
+    ap.add_argument("--setup", action="store_true",
+                    help="enter and save your Alpaca API keys")
     args = ap.parse_args()
+
+    if args.setup:
+        setup()
+        return 0
 
     if args.diagnose:
         diagnose()

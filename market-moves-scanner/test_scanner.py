@@ -95,5 +95,118 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(s.new_signals(x, state, "d2")), 1)
 
 
+def iso(t):
+    return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def alpaca_rows(b):
+    return [{"t": iso(t), "o": o, "h": h, "l": l, "c": c, "v": v, "n": 1,
+             "vw": c} for t, o, h, l, c, v in zip(*b.cols())]
+
+
+class FakeAlpacaHTTP:
+    """Serves Alpaca-format JSON (shapes from the official alpaca-py SDK)."""
+
+    def __init__(self):
+        self.calls = []
+        closes = [100 - 0.09 * (i + 1) for i in range(54)]
+        self.intraday = {"ABC": bars(closes, vols=[1.3e6] * 54,
+                                     first_open=100.0),
+                         "QUIET": bars([100.0] * 54), "SPY": FLAT_SPY}
+        d = daily()
+        # Daily bars end the day before the session, at midnight ET.
+        day0 = OPEN.replace(hour=0, minute=0) - dt.timedelta(days=len(d.ts))
+        d.ts = [int((day0 + dt.timedelta(days=i)).timestamp())
+                for i in range(len(d.ts))]
+        d.close[-1] = 100.0
+        self.daily = d
+
+    def __call__(self, url, headers=None, timeout=20, opener=None):
+        import json, urllib.parse
+        u = urllib.parse.urlsplit(url)
+        q = dict(urllib.parse.parse_qsl(u.query))
+        self.calls.append((u.path, q))
+        if "news.google.com" in url or "yahoo" in url:
+            raise s.FetchError(429, url)
+        assert headers["APCA-API-KEY-ID"] == "k"
+        if u.path == "/v1beta1/screener/stocks/most-actives":
+            return json.dumps({"most_actives": [
+                {"symbol": x, "volume": 1, "trade_count": 1}
+                for x in ("SPY", "ABC", "QUIET")],
+                "last_updated": "2026-09-29T18:00:00.123456789Z"}).encode()
+        if u.path == "/v2/stocks/bars":
+            syms = q["symbols"].split(",")
+            if q["timeframe"] == "1Day":
+                data = {x: alpaca_rows(self.daily) for x in syms}
+            else:
+                data = {x: alpaca_rows(self.intraday[x]) for x in syms}
+            # Paginate: first page holds the first symbol only.
+            if len(syms) > 1 and "page_token" not in q:
+                return json.dumps({"bars": {syms[0]: data[syms[0]]},
+                                   "next_page_token": "p2"}).encode()
+            if "page_token" in q:
+                data.pop(syms[0])
+            return json.dumps({"bars": data,
+                               "next_page_token": None}).encode()
+        if u.path == "/v1beta1/news":
+            return json.dumps({"news": [{
+                "id": 1, "headline": "ABC CEO to resign", "source": "benzinga",
+                "url": "https://x", "summary": "", "author": "", "content": "",
+                "created_at": "2026-09-29T12:00:00.5Z",
+                "updated_at": "2026-09-29T12:00:00Z",
+                "symbols": ["ABC", "XYZ"]}],
+                "next_page_token": None}).encode()
+        raise AssertionError(url)
+
+
+class AlpacaScanTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self._cache, s.CACHE = s.CACHE, self.tmp
+        self._get, self.fake = s.http_get, FakeAlpacaHTTP()
+        s.http_get = self.fake
+
+    def tearDown(self):
+        s.CACHE, s.http_get = self._cache, self._get
+
+    def test_scan_end_to_end(self):
+        api = s.Alpaca("k", "secret", "iex")
+        report, results = s.scan(NOW.astimezone(dt.timezone.utc), True, api)
+        self.assertEqual([r["move"].symbol for r in results], ["ABC"])
+        r = results[0]
+        self.assertAlmostEqual(r["move"].move_pct, -4.86, places=2)
+        self.assertEqual([h["title"] for h in r["move"].headlines],
+                         ["ABC CEO to resign"])
+        self.assertIsNone(r["rating"].factors["valuation"])
+        self.assertIn("valuation n/a", report)
+        self.assertIn("Alpaca most actives; iex feed", report)
+        bar_calls = [q for p, q in self.fake.calls if p == "/v2/stocks/bars"]
+        self.assertTrue(all(q["feed"] == "iex" for q in bar_calls))
+        self.assertTrue(any(q.get("page_token") == "p2" for q in bar_calls))
+        # Daily bars are cached: a second scan doesn't refetch them.
+        n = sum(1 for q in bar_calls if q["timeframe"] == "1Day")
+        s.scan(NOW.astimezone(dt.timezone.utc), True, api)
+        n2 = sum(1 for p, q in self.fake.calls
+                 if p == "/v2/stocks/bars" and q["timeframe"] == "1Day")
+        self.assertEqual(n, n2)
+
+    def test_closed_market_skips(self):
+        api = s.Alpaca("k", "secret")
+        sunday = dt.datetime(2026, 10, 4, 12, 0, tzinfo=s.ET)
+        self.assertEqual(s.scan(sunday, False, api), ("", []))
+
+    def test_missing_keys_explains_setup(self):
+        with self.assertRaises(SystemExit) as e:
+            s.Alpaca("", "")
+        self.assertIn("--setup", str(e.exception))
+
+    def test_parse_ts_nanoseconds(self):
+        self.assertEqual(s.parse_ts("2026-09-29T13:30:00.123456789Z"),
+                         int(dt.datetime(2026, 9, 29, 13, 30,
+                                         tzinfo=dt.timezone.utc).timestamp()))
+
+
 if __name__ == "__main__":
     unittest.main()

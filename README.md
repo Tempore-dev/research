@@ -10,7 +10,7 @@ Market and product research for Tempore: what to build next, for whom, and why. 
 
 ## Tools
 
-- [Market move scanner](market-moves-scanner/): runs on your computer and checks the most traded US stocks every 5 minutes for large moves, classifies each as news-driven or automated selling, and rates it Strong Buy / Buy / Hold.
+- [Market move scanner](market-moves-scanner/): runs on your computer and uses Alpaca market data to check the most traded US stocks every 5 minutes for large moves, classifies each as news-driven or automated selling, and rates it Strong Buy / Buy / Hold.
 
 ## Conventions
 
