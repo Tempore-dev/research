@@ -36,6 +36,7 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -85,6 +86,7 @@ NEWS_LOOKBACK_H = 18                                     # covers overnight
 REPORTS = os.environ.get(
     "REPORTS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "reports"))
+CACHE = os.path.join(REPORTS, ".cache")
 
 FALLBACK_TICKERS = [
     "NVDA", "TSLA", "AAPL", "AMD", "PLTR", "AMZN", "MSFT", "META", "GOOGL",
@@ -126,20 +128,105 @@ POSITIVE = [
 
 # ---------------------------------------------------------------- data layer
 
+class FetchError(Exception):
+    def __init__(self, code: int, url: str) -> None:
+        super().__init__(f"HTTP {code} from {urllib.parse.urlsplit(url).netloc}")
+        self.code = code
+
+
 class Yahoo:
-    """Minimal Yahoo Finance client (cookie + crumb aware)."""
+    """Minimal Yahoo Finance client (cookie + crumb aware).
+
+    Yahoo often answers plain Python HTTP clients with 429 Too Many Requests
+    regardless of volume, so requests go through the first transport that
+    works: curl_cffi (if installed; impersonates Chrome), then urllib, then
+    the system curl binary. Requests are spaced out and retried on 429."""
+
+    GAP_S = 0.35   # minimum spacing between requests
 
     def __init__(self) -> None:
         self.jar = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.jar))
         self.crumb: str | None = None
+        self.transport = "urllib"
+        self.cffi = None
+        try:
+            from curl_cffi import requests as cffi_requests
+            self.cffi = cffi_requests.Session(impersonate="chrome")
+            self.transport = "curl_cffi"
+        except Exception:
+            pass
+        self.curl_jar = os.path.join(CACHE, "cookies.txt")
+        self._last = 0.0
 
-    def _get(self, url: str, timeout: int = 15) -> bytes:
+    def _fetch(self, url: str, timeout: int) -> bytes:
+        wait = self.GAP_S - (time.time() - self._last)
+        if wait > 0:
+            time.sleep(wait)
+        self._last = time.time()
+        if self.transport == "curl_cffi":
+            r = self.cffi.get(url, timeout=timeout)
+            if r.status_code >= 400:
+                raise FetchError(r.status_code, url)
+            return r.content
+        if self.transport == "curl":
+            os.makedirs(CACHE, exist_ok=True)
+            p = subprocess.run(
+                ["curl", "-sS", "-L", "--compressed", "-m", str(timeout),
+                 "-A", UA, "-H", "Accept: */*", "-b", self.curl_jar,
+                 "-c", self.curl_jar, "-w", "\n%{http_code}", url],
+                capture_output=True, timeout=timeout + 5)
+            body, _, code = p.stdout.rpartition(b"\n")
+            status = int(code or 0)
+            if p.returncode or status >= 400 or status == 0:
+                raise FetchError(status, url)
+            return body
         req = urllib.request.Request(url, headers={"User-Agent": UA,
                                                    "Accept": "*/*"})
-        with self.opener.open(req, timeout=timeout) as r:
-            return r.read()
+        try:
+            with self.opener.open(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            raise FetchError(e.code, url) from None
+
+    def _get(self, url: str, timeout: int = 15) -> bytes:
+        for attempt in range(4):
+            try:
+                return self._fetch(url, timeout)
+            except FetchError as e:
+                if e.code not in (429, 403, 999) or attempt == 3:
+                    raise
+                # Blocked: fall back to the system curl binary once, then
+                # back off and alternate Yahoo's two API hosts.
+                if self.transport == "urllib" and shutil.which("curl"):
+                    self.transport = "curl"
+                    url = self._reauth(url, timeout)
+                    continue
+                time.sleep(2 * (attempt + 1))
+                url = (url.replace("//query1.", "//query2.")
+                       if "//query1." in url
+                       else url.replace("//query2.", "//query1."))
+        raise AssertionError("unreachable")
+
+    def _reauth(self, url: str, timeout: int) -> str:
+        """After switching transport, cookies and crumb must be re-issued."""
+        if "getcrumb" in url:
+            try:
+                self._fetch("https://fc.yahoo.com", timeout)
+            except FetchError:
+                pass  # 404 is expected; it still sets the cookie
+            return url
+        if "crumb=" in url:
+            self.crumb = None
+            url = re.sub(r"[&?]crumb=[^&]*", "", url)
+            self._ensure_crumb()
+            if self.crumb:
+                sep = "&" if "?" in url else "?"
+                url += f"{sep}crumb={urllib.parse.quote(self.crumb)}"
+        else:
+            self.crumb = None
+        return url
 
     def _json(self, url: str, crumb: bool = False) -> dict:
         if crumb:
@@ -591,6 +678,61 @@ def in_session_window(now: dt.datetime) -> bool:
             and dt.time(9, 35) <= et.time() <= dt.time(16, 5))
 
 
+def cached_daily(y: Yahoo, sym: str, now: dt.datetime) -> dict:
+    """1y of daily bars, fetched once per symbol per day (they only change
+    at the close), which cuts each scan's requests by a third."""
+    path = os.path.join(CACHE, f"daily-{sym}-{now.astimezone(ET):%Y%m%d}"
+                               ".json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        pass
+    c = y.chart(sym, "1y", "1d")
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        for old in os.listdir(CACHE):
+            if old.startswith(f"daily-{sym}-"):
+                os.remove(os.path.join(CACHE, old))
+        with open(path, "w") as f:
+            json.dump(c, f)
+    except OSError:
+        pass
+    return c
+
+
+def diagnose() -> None:
+    """Check each data source and transport; prints one line per check."""
+    y = Yahoo()
+    checks = [
+        ("price chart", "https://query1.finance.yahoo.com/v8/finance/chart/"
+                        "SPY?range=1d&interval=5m"),
+        ("cookie", "https://fc.yahoo.com"),
+        ("crumb", "https://query1.finance.yahoo.com/v1/test/getcrumb"),
+        ("news", "https://query1.finance.yahoo.com/v1/finance/search?q=AAPL"
+                 "&quotesCount=0&newsCount=3"),
+        ("google news", "https://news.google.com/rss/search?q=AAPL"),
+    ]
+    transports = (["curl_cffi"] if y.cffi else []) + ["urllib"] + (
+        ["curl"] if shutil.which("curl") else [])
+    for t in transports:
+        y.transport = t
+        for name, url in checks:
+            try:
+                n = len(y._fetch(url, 15))
+                print(f"{t:9} {name:12} OK ({n} bytes)")
+            except FetchError as e:
+                print(f"{t:9} {name:12} {e}")
+            except Exception as e:
+                print(f"{t:9} {name:12} error: {e}")
+    try:
+        y.transport = transports[0]
+        y.crumb = None
+        print(f"most actives: {len(y.most_active(5))} rows")
+    except Exception as e:
+        print(f"most actives: failed ({e})")
+
+
 def market_open(now: dt.datetime, spy: Bars) -> bool:
     if not in_session_window(now):
         return False
@@ -622,7 +764,7 @@ def scan(now: dt.datetime, force: bool = False) -> tuple[str, list[dict]]:
         try:
             ic = y.chart(sym, "1d", "5m")
             intraday = Bars.from_chart(ic)
-            daily = Bars.from_chart(y.chart(sym, "1y", "1d"))
+            daily = Bars.from_chart(cached_daily(y, sym, now))
             # Drop today's (partial) daily bar so it doesn't skew stats.
             if daily.ts and dt.datetime.fromtimestamp(
                     daily.ts[-1], ET).date() == now.astimezone(ET).date():
@@ -853,7 +995,13 @@ def main() -> int:
                     help="schedule a scan every 5 minutes on this computer")
     ap.add_argument("--uninstall", action="store_true",
                     help="remove the schedule")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="test the data sources and print what works")
     args = ap.parse_args()
+
+    if args.diagnose:
+        diagnose()
+        return 0
 
     if args.install:
         install()

@@ -68,10 +68,12 @@ A score of 68 or more with catalyst ≥ 60 rates **Strong Buy**. A score of 56 o
 - `--force`: run even when the market is closed (uses the last session's data).
 - `--no-alert`: skip desktop notifications.
 - `--every MIN`: keep running and scan every MIN minutes.
+- `--diagnose`: test each data source and print which ones respond. Use it when a scan fails.
 - **Thresholds:** set the `TOP_N`, `MOVE_PCT` and `MOVE_SIGMA` environment variables. `REPORTS_DIR` moves the reports folder.
 - **Tests:** `python3 -m unittest test_scanner.py` (offline, synthetic data).
 
 ## Limits
 
+- **HTTP 429 (Too Many Requests):** Yahoo often blocks plain Python HTTP clients, even at low volume. The scanner retries through your system `curl` and spaces out its requests. If 429s continue, `python3 -m pip install curl_cffi` makes requests look like Chrome's. The scanner uses it automatically when it's installed.
 - Yahoo Finance's endpoints are unofficial and can change or rate-limit without notice. If the most-actives list fails, the scanner falls back to a fixed list of high-volume tickers.
 - Scans only run while the computer is on and awake. A sleeping laptop misses them.
